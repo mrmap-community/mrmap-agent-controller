@@ -19,6 +19,8 @@
   "spawn_reconcile_grace_minutes": 20,
   "docker_test_wrapper": "/home/ota/.ao/bin/mrmap-docker-test",
   "capacity_script": "/home/ota/agent-orchestrator-test/mrmap/scripts/agent_capacity",
+  "wip_script": "/home/ota/agent-orchestrator-test/mrmap/scripts/wip",
+  "board_issue": 917,
   "count_foreign_workers": true,
   "allow_restore_terminated": false,
   "use_thread_resolution": true,

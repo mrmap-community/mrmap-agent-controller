@@ -69,7 +69,7 @@ class Capacity:
 
 class Controller:
     def __init__(self, cfg, gh, ao, database, log, capacity_probe=None,
-                 pause_file=None, execute=False, now=None):
+                 pause_file=None, execute=False, now=None, board_refresher=None):
         self.cfg = cfg
         self.gh = gh
         self.ao = ao
@@ -80,6 +80,14 @@ class Controller:
         self.pause_file = Path(pause_file) if pause_file else None
         self.capacity_probe = capacity_probe if capacity_probe is not None \
             else lambda: self._host_capacity()
+        # W5: the board refresh is injectable for tests (like capacity_probe);
+        # production runs scripts/wip board through lifecycle.refresh_board.
+        self.board_refresher = board_refresher if board_refresher is not None \
+            else lambda: st.refresh_board(self.cfg, self.log)
+        self.claims_changed = False
+        # issue -> the claim state reconcile() established for this tick, which
+        # is the truth the issues projection must follow even in a dry run.
+        self.claim_truth = {}
         self.gh_ok = True
         self.ao_ok = True
         self.actions = []
@@ -198,6 +206,37 @@ class Controller:
                            detail=note)
             return
         db.set_claim(self.db, issue, state, self.now(), note=note, session_id=session_id)
+        self.claims_changed = True
+
+    def project(self, issue, state, now, **fields):
+        """Write the derived ``issues`` projection (W1: the claim is the truth).
+
+        ``issues`` is a projection of ``claims``, never an independent opinion.
+        A quarantined claim must not be projected back into a state that says
+        work is proceeding, because the follow loop reads pull requests and
+        sessions and would happily write ``awaiting_ci`` for a dead worker --
+        live example #1009: claim ``needs_reconciliation``, issue
+        ``awaiting_review`` on PR #1114, every tick forever. The guard covers
+        the whole projection, not only the no-pull-request tail.
+
+        Which claim state applies is decided by :meth:`reconcile` for this tick
+        (``claim_truth``) and only read from the table as a fallback: a dry run
+        computes an adoption it deliberately does not write, and must not then
+        be contradicted by the stale row it left behind.
+
+        Terminal facts are never suppressed -- a merged, closed, paused or
+        ready-for-human-merge pull request is information a human needs even
+        while its claim sits in quarantine.
+        """
+        truth = self.claim_truth.get(issue)
+        if truth is None:
+            claim = db.get_claim(self.db, issue)
+            truth = claim['state'] if claim else None
+        if truth == db.CLAIM_RECONCILE and state in st.ACTIONABLE:
+            state = st.FAILED
+            fields['reason'] = 'claim quarantined; ' + (
+                fields.get('reason') or 'no deliverable state is projected')
+        return db.upsert_issue(self.db, issue, state, now, **fields)
 
     # ------------------------------------------------------- reconciliation --
     def reconcile(self, capacity):
@@ -217,9 +256,9 @@ class Controller:
             sessions = self.by_issue.get(issue, [])
             live = [s for s in sessions if not s.is_terminated]
             if len(live) > 1:
-                db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                                session_id=','.join(s.id for s in live),
-                                reason='multiple live AO sessions carry this issueId')
+                self.project(issue, st.FAILED, self.now(),
+                             session_id=','.join(s.id for s in live),
+                             reason='multiple live AO sessions carry this issueId')
                 self.event('NEEDS_HUMAN', issue=issue,
                            reason=f'{len(live)} live sessions claim this issue: '
                                   f'{", ".join(s.id for s in live)}; the '
@@ -227,13 +266,14 @@ class Controller:
                 continue
             if not live and sessions and state != db.CLAIM_MERGED:
                 dead = sessions[0]
+                self.claim_truth[issue] = db.CLAIM_RECONCILE
                 self._set_claim(issue, db.CLAIM_RECONCILE,
                                 f'responsible session {dead.id} is terminated; '
                                 f'workspace cleanup={dead.workspace_cleanup or "unknown"}',
                                 session_id=dead.id)
-                db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                                session_id=dead.id,
-                                reason='responsible session terminated')
+                self.project(issue, st.FAILED, self.now(),
+                             session_id=dead.id,
+                             reason='responsible session terminated')
                 self.event('NEEDS_HUMAN', issue=issue, session=dead.id,
                            reason='the AO session carrying this issue is terminated'
                                   + (' (its workspace is already removed)'
@@ -243,6 +283,10 @@ class Controller:
                 continue
             if live:
                 sess = live[0]
+                # A live session carrying the issueId outranks any quarantined
+                # row: this tick adopts, so the projection must not be clamped
+                # to failed by the stale claim the dry run did not rewrite.
+                self.claim_truth[issue] = db.CLAIM_SPAWNED
                 if state in (db.CLAIM_QUEUED, db.CLAIM_SPAWNING, db.CLAIM_RECONCILE,
                              db.CLAIM_SPAWNED) and claim['session_id'] != sess.id:
                     self._set_claim(issue, db.CLAIM_SPAWNED,
@@ -254,9 +298,9 @@ class Controller:
                                       + ('restored' if self.execute else 'would be '
                                          'restored'))
                 pr_number = self.pr_for(issue, sess)
-                db.upsert_issue(self.db, issue,
-                                st.PR_OPEN if pr_number else st.RUNNING, self.now(),
-                                session_id=sess.id, pr_number=pr_number)
+                self.project(issue,
+                             st.PR_OPEN if pr_number else st.RUNNING, self.now(),
+                             session_id=sess.id, pr_number=pr_number)
                 continue
             # No live session for a held claim.
             existing = db.get_issue(self.db, issue)
@@ -267,17 +311,18 @@ class Controller:
                     self.event('PENDING_SPAWN', issue=issue,
                                reason='claim exists without a live session and is '
                                       'still inside the spawn grace window')
-                    db.upsert_issue(self.db, issue, st.QUEUED, self.now(),
-                                    session_id=claim['session_id'])
+                    self.project(issue, st.QUEUED, self.now(),
+                                 session_id=claim['session_id'])
                     continue
+                self.claim_truth[issue] = db.CLAIM_RECONCILE
                 self._set_claim(
                     issue, db.CLAIM_RECONCILE,
                     'no AO session found for this claim; needs '
                     'mrmap-controller release <issue> --confirm to allow a retry',
                     session_id=claim['session_id'])
-                db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                                session_id=claim['session_id'],
-                                reason='claim without session after grace window')
+                self.project(issue, st.FAILED, self.now(),
+                             session_id=claim['session_id'],
+                             reason='claim without session after grace window')
                 self.event('NEEDS_HUMAN' if self.execute else 'WOULD_QUARANTINE',
                            issue=issue,
                            reason='claim exists but no AO session carries the issueId; '
@@ -285,9 +330,10 @@ class Controller:
                                      if self.execute else
                                      'claim would be quarantined for a human decision'))
             elif state == db.CLAIM_RECONCILE:
-                db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                                session_id=claim['session_id'],
-                                reason='claim quarantined')
+                self.claim_truth[issue] = db.CLAIM_RECONCILE
+                self.project(issue, st.FAILED, self.now(),
+                             session_id=claim['session_id'],
+                             reason='claim quarantined')
 
     def _within_grace(self, created_at):
         import datetime as dt
@@ -328,6 +374,7 @@ class Controller:
                 if not claim and self.execute:
                     db.claim_issue(self.db, number, db.CLAIM_SPAWNED, self.now(),
                                    'adopted existing AO session', session_id=sess.id)
+                    self.claims_changed = True
                 self.event('SKIP', issue=number, session=sess.id,
                            reason='an AO worker session already carries this issueId')
                 continue
@@ -392,6 +439,9 @@ class Controller:
             self.event('DEFER', issue=number,
                        reason='controller pause marker present; start is report-only')
             return
+        # From here every path writes the claim row (reserve, re-arm, or move it
+        # after a refused/uncertain start); board refresh is owed either way.
+        self.claims_changed = True
         title = (issue.get('title') or '')[:80]
         existing = db.get_claim(self.db, number)
         if existing and existing['state'] == db.CLAIM_RELEASED:
@@ -511,14 +561,69 @@ class Controller:
 
     def follow_pull_requests(self, capacity):
         for issue in self.tracked_issues():
+            claim = db.get_claim(self.db, issue)
+            if claim and claim['state'] == db.CLAIM_MERGED:
+                # W1: a merged claim is retired. The row stays for audit and
+                # keeps intake away, but the merged pull request is never
+                # re-fetched again -- until the incident audit this cost 53
+                # `gh pr view` calls every tick, forever.
+                continue
             try:
                 self._follow_one(issue, capacity)
             except (GithubError, AOError) as exc:
                 # One issue's uncertainty must not stop the others; it also must
                 # not turn into an action.
                 self.event('SKIP', issue=issue, reason=f'uncertain state: {redact(exc)}')
+            except Exception as exc:
+                # W4: a controller-side error in one issue's follow (a schema
+                # problem, a bug, anything) is isolated to that issue. Before
+                # this, one poison pull request aborted the whole tick -- 456
+                # times. The runs ledger keeps outcome 'ok' and the other pull
+                # requests are still followed; the failure gets a bounded
+                # backoff instead of a per-tick retry storm.
+                self.event('PR_FOLLOW_FAILED', issue=issue, reason=redact(exc))
+                self._record_follow_failure(issue, exc)
+
+    def _record_follow_failure(self, issue, exc):
+        """Bookkeep a controller-side follow failure and open the retry window.
+
+        The state is one dispatch row per issue, deduped on ``follow_error``
+        (a kind no delivery budget reads), so the backoff is restart-safe in
+        the same table as the deliveries: ``attempts`` counts occurrences and
+        the next retry moves out by a window that doubles from the tick
+        interval, capped at 6 hours. Recording failures is the controller's
+        own ledger, so it happens in dry-run too.
+        """
+        key = f'follow_error:{issue}'
+        try:
+            existing = db.dispatch_for(self.db, key)
+            if existing is None:
+                row = db.get_issue(self.db, issue)
+                db.try_reserve_dispatch(self.db, 'follow_error', issue, key,
+                                        self.now(),
+                                        pr_number=row['pr_number'] if row else None,
+                                        detail=redact(exc))
+                attempts = 1
+            else:
+                db.bump_dispatch(self.db, key)
+                attempts = int(existing['attempts']) + 1
+            delay = _backoff_delay(self.cfg, attempts)
+            db.set_dispatch(self.db, key, 'failed', detail=redact(exc),
+                            next_retry_at=_retry_after(self.now(), delay))
+        except Exception as record_exc:      # never let bookkeeping mask the bug
+            self.log.error('follow_failure_bookkeeping_failed', issue=issue,
+                           reason=redact(record_exc))
 
     def _follow_one(self, issue, capacity):
+        # W4 backoff gate: a controller-side failure of this issue's follow is
+        # retried no earlier than its bounded window says.
+        err = db.dispatch_for(self.db, f'follow_error:{issue}')
+        if err and err['status'] == 'failed' \
+                and _retry_wait(err['next_retry_at'], self.now()):
+            self.event('DEFER', issue=issue, pr=err['pr_number'],
+                       reason=f'controller-side failure backoff: next attempt '
+                              f'no earlier than {err["next_retry_at"]}')
+            return
         row = db.get_issue(self.db, issue)
         if row and row['state'] == st.PAUSED:
             paused = True
@@ -540,23 +645,38 @@ class Controller:
         else:
             session = None
         if paused:
-            db.upsert_issue(self.db, issue, st.PAUSED, self.now(),
-                            session_id=session.id if session else None,
-                            reason=f'{self.cfg.paused_label} label present')
+            self.project(issue, st.PAUSED, self.now(),
+                         session_id=session.id if session else None,
+                         reason=f'{self.cfg.paused_label} label present')
             self.event('SKIP', issue=issue, reason='issue is paused; no work delivered')
             return
         if len(live) > 1:
             return                                  # reconcile already reported it
         pr_number = self.pr_for(issue, session)
         if pr_number is None:
+            claim = db.get_claim(self.db, issue)
+            claim_state = claim['state'] if claim else None
+            if claim_state in (db.CLAIM_RECONCILE, db.CLAIM_MERGED):
+                # W1: the claims row is the source of truth and the issues row
+                # is its derived projection. A quarantined claim must never be
+                # projected back to an active state by a dead session still
+                # carrying the issueId -- until the incident audit, issues #981
+                # said running/mrmap-77 forever while its claim read
+                # needs_reconciliation. A merged claim never re-opens either.
+                if claim_state == db.CLAIM_RECONCILE:
+                    self.project(issue, st.FAILED, self.now(),
+                                 session_id=claim['session_id'],
+                                 reason='claim quarantined; the issues row '
+                                        'follows the claim, not the session')
+                return
             if session:
-                db.upsert_issue(self.db, issue, st.RUNNING, self.now(),
-                                session_id=session.id)
+                self.project(issue, st.RUNNING, self.now(),
+                             session_id=session.id)
             elif row and row['state'] in (st.FAILED, st.MERGED, st.PAUSED):
                 pass
             else:
-                db.upsert_issue(self.db, issue, st.QUEUED, self.now(),
-                                reason='no pull request yet')
+                self.project(issue, st.QUEUED, self.now(),
+                             reason='no pull request yet')
             return
         try:
             pr = self.gh.pr_view(pr_number)
@@ -576,10 +696,10 @@ class Controller:
         if pr.get('state') == 'MERGED':
             self._set_claim(issue, db.CLAIM_MERGED, f'PR #{pr_number} merged',
                             session_id=session.id if session else None)
-            db.upsert_issue(self.db, issue, st.MERGED, self.now(), session_id=session.id
-                            if session else None, pr_number=pr_number,
-                            head_sha=head_sha, ci_status='success',
-                            review_state='approved', reason='pull request merged')
+            self.project(issue, st.MERGED, self.now(), session_id=session.id
+                         if session else None, pr_number=pr_number,
+                         head_sha=head_sha, ci_status='success',
+                         review_state='approved', reason='pull request merged')
             self.event('MERGED' if self.execute else 'WOULD_RETIRE_CLAIM',
                        issue=issue, pr=pr_number,
                        reason='merged by a human; claim '
@@ -587,9 +707,9 @@ class Controller:
                               + ', the controller merges nothing')
             return
         if pr.get('state') == 'CLOSED':
-            db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                            session_id=session.id if session else None,
-                            pr_number=pr_number, reason='pull request closed unmerged')
+            self.project(issue, st.FAILED, self.now(),
+                         session_id=session.id if session else None,
+                         pr_number=pr_number, reason='pull request closed unmerged')
             self.event('NEEDS_HUMAN', issue=issue, pr=pr_number,
                        reason='pull request closed without merge; the controller '
                               'will not reopen or resubmit')
@@ -618,21 +738,21 @@ class Controller:
             state = self._deliver(issue, session, pr, failures, items,
                                   head_sha, capacity, base)
         elif ci_status == 'pending':
-            db.upsert_issue(self.db, issue, st.AWAITING_CI, self.now(),
-                            reason='checks still running', **base)
+            self.project(issue, st.AWAITING_CI, self.now(),
+                         reason='checks still running', **base)
             self.event('WAIT_CI', issue=issue, pr=pr_number, sha=head_sha,
                        reason=f'{len(checks)} check(s) still in progress')
         elif ci_status == 'unknown':
-            db.upsert_issue(self.db, issue, st.AWAITING_CI, self.now(),
-                            reason='check rollup is empty or belongs to another '
-                                   'commit; nothing trustworthy to act on', **base)
+            self.project(issue, st.AWAITING_CI, self.now(),
+                         reason='check rollup is empty or belongs to another '
+                                'commit; nothing trustworthy to act on', **base)
             self.event('WAIT_CI', issue=issue, pr=pr_number, sha=head_sha,
                        reason='no trustworthy CI result for this head commit')
         else:                                   # CI green
             if review_error:
-                db.upsert_issue(self.db, issue, st.AWAITING_REVIEW, self.now(),
-                                reason=f'review feedback unreadable: {review_error}',
-                                **base)
+                self.project(issue, st.AWAITING_REVIEW, self.now(),
+                             reason=f'review feedback unreadable: {review_error}',
+                             **base)
                 self.event('SKIP', issue=issue, pr=pr_number,
                            reason=f'review feedback unreadable: {review_error}')
                 return
@@ -644,10 +764,10 @@ class Controller:
                 state = st.READY_FOR_HUMAN_MERGE
             else:
                 state = st.AWAITING_REVIEW
-            db.upsert_issue(self.db, issue, state, self.now(),
-                            reason='CI green; waiting for human review'
-                            if state == st.AWAITING_REVIEW
-                            else 'CI green and approved; a human merges', **base)
+            self.project(issue, state, self.now(),
+                         reason='CI green; waiting for human review'
+                         if state == st.AWAITING_REVIEW
+                         else 'CI green and approved; a human merges', **base)
             self.event('IDLE' if state == st.AWAITING_REVIEW else 'READY',
                        issue=issue, pr=pr_number, state=state,
                        reason='nothing for the controller to deliver'
@@ -666,10 +786,10 @@ class Controller:
         kind = 'combined' if len(kinds) == 2 else kinds[0]
         if failures and db.attempt_count(self.db, pr_number, ('ci', 'combined')) \
                 >= self.cfg.max_ci_attempts_per_pr:
-            db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                            reason=f'CI still failing after '
-                                   f'{self.cfg.max_ci_attempts_per_pr} delivered fix '
-                                   f'request(s)', **base)
+            self.project(issue, st.FAILED, self.now(),
+                         reason=f'CI still failing after '
+                                f'{self.cfg.max_ci_attempts_per_pr} delivered fix '
+                                f'request(s)', **base)
             self.event('NEEDS_HUMAN', issue=issue, pr=pr_number,
                        reason=f'CI fix attempts exhausted '
                               f'({self.cfg.max_ci_attempts_per_pr}); failing checks: '
@@ -677,10 +797,10 @@ class Controller:
             return st.FAILED
         if items and db.attempt_count(self.db, pr_number, ('review', 'combined')) \
                 >= self.cfg.max_review_rounds_per_pr:
-            db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                            reason=f'{len(items)} review item(s) remain after '
-                                   f'{self.cfg.max_review_rounds_per_pr} delivered '
-                                   f'round(s)', **base)
+            self.project(issue, st.FAILED, self.now(),
+                         reason=f'{len(items)} review item(s) remain after '
+                                f'{self.cfg.max_review_rounds_per_pr} delivered '
+                                f'round(s)', **base)
             self.event('NEEDS_HUMAN', issue=issue, pr=pr_number,
                        reason=f'review rounds exhausted '
                               f'({self.cfg.max_review_rounds_per_pr})')
@@ -689,43 +809,43 @@ class Controller:
         existing = db.dispatch_for(self.db, key)
         if existing and existing['status'] != 'failed':
             state = st.ADDRESSING_REVIEW if 'review' in kind else st.FIXING_CI
-            db.upsert_issue(self.db, issue, state, self.now(),
-                            reason=f'{kind} work already delivered once for this '
-                                   f'state (dispatch {existing["id"]}, '
-                                   f'status {existing["status"]})', **base)
+            self.project(issue, state, self.now(),
+                         reason=f'{kind} work already delivered once for this '
+                                f'state (dispatch {existing["id"]}, '
+                                f'status {existing["status"]})', **base)
             self.event('ALREADY_DELIVERED', issue=issue, pr=pr_number, sha=head_sha,
                        reason=f'{kind} request already recorded with status '
                               f'{existing["status"]}; not repeated')
             return state
         if session is None:
-            db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                            reason=f'work is pending on PR #{pr_number} but no live '
-                                   f'AO session carries this issue', **base)
+            self.project(issue, st.FAILED, self.now(),
+                         reason=f'work is pending on PR #{pr_number} but no live '
+                                f'AO session carries this issue', **base)
             self.event('NEEDS_HUMAN', issue=issue, pr=pr_number,
                        reason=f'{kind} work pending but no responsible worker session')
             return st.FAILED
         if session.is_terminated:
-            db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                            session_id=session.id,
-                            reason='responsible session is terminated', **base)
+            self.project(issue, st.FAILED, self.now(),
+                         session_id=session.id,
+                         reason='responsible session is terminated', **base)
             self.event('NEEDS_HUMAN', issue=issue, pr=pr_number, session=session.id,
                        reason='responsible AO session is terminated (workspace may be '
                               'removed); the controller does not restore it')
             return st.FAILED
         if self.controller_paused:
-            db.upsert_issue(self.db, issue, st.ADDRESSING_REVIEW if items
-                            else st.FIXING_CI, self.now(),
-                            reason='controller pause marker present; delivery is '
-                                   'report-only', **base)
+            self.project(issue, st.ADDRESSING_REVIEW if items
+                         else st.FIXING_CI, self.now(),
+                         reason='controller pause marker present; delivery is '
+                                'report-only', **base)
             self.event('DEFER', issue=issue, pr=pr_number, session=session.id,
                        reason='controller pause marker present; delivery is '
                               'report-only')
             return st.ADDRESSING_REVIEW if items else st.FIXING_CI
         needs_slot = not session.executing
         if needs_slot and not capacity.free():
-            db.upsert_issue(self.db, issue, st.AWAITING_REVIEW if items else st.AWAITING_CI,
-                            self.now(), reason=f'waiting for a slot: '
-                                               f'{capacity.summary()}', **base)
+            self.project(issue, st.AWAITING_REVIEW if items else st.AWAITING_CI,
+                         self.now(), reason=f'waiting for a slot: '
+                                            f'{capacity.summary()}', **base)
             self.event('DEFER', issue=issue, pr=pr_number, session=session.id,
                        reason=f'worker limit reached ({capacity.summary()}); {kind} '
                               f'work waits for a slot instead of being dropped')
@@ -758,16 +878,16 @@ class Controller:
             if needs_slot:
                 capacity.take(f'woke worker for PR #{pr_number}')
             state = st.ADDRESSING_REVIEW if items else st.FIXING_CI
-            db.upsert_issue(self.db, issue, state, self.now(), reason=detail, **base)
+            self.project(issue, state, self.now(), reason=detail, **base)
             self.event('DISPATCHED', issue=issue, pr=pr_number, session=session.id,
                        sha=head_sha, detail=f'{kind}: {detail}')
             return state
         if detail == 'uncertain':
             db.set_dispatch(self.db, key, 'uncertain', session_id=session.id)
             self._mark_seen(issue, pr_number, items, head_sha, key)
-            db.upsert_issue(self.db, issue, st.FAILED, self.now(),
-                            reason='delivery outcome unknown; not retried '
-                                   'automatically', **base)
+            self.project(issue, st.FAILED, self.now(),
+                         reason='delivery outcome unknown; not retried '
+                                'automatically', **base)
             self.event('NEEDS_HUMAN', issue=issue, pr=pr_number, session=session.id,
                        reason='AO delivery outcome unknown; the controller will not '
                               'risk a duplicate resume')
@@ -775,8 +895,8 @@ class Controller:
         # A definite failure stays recorded with the same dedupe key: the retry
         # limit counts it, so an undeliverable item cannot loop forever.
         db.set_dispatch(self.db, key, 'failed', session_id=session.id, detail=detail)
-        db.upsert_issue(self.db, issue, st.FIXING_CI if failures else st.AWAITING_REVIEW,
-                        self.now(), reason=f'delivery failed: {detail}', **base)
+        self.project(issue, st.FIXING_CI if failures else st.AWAITING_REVIEW,
+                     self.now(), reason=f'delivery failed: {detail}', **base)
         self.event('DISPATCH_FAILED', issue=issue, pr=pr_number, session=session.id,
                    reason=detail)
         return st.FIXING_CI if failures else st.AWAITING_REVIEW
@@ -834,6 +954,14 @@ class Controller:
             self.reconcile(capacity)
             self.intake(capacity)
             self.follow_pull_requests(capacity)
+            if self.execute and self.claims_changed:
+                # W5: board #917 is only regenerated by scripts/wip commands,
+                # so a tick that moved a claim must ask wip for a refresh --
+                # the board's format stays wip's, duplicated nowhere here.
+                try:
+                    self.board_refresher()
+                except Exception as exc:     # a board problem never eats a tick
+                    self.log.warning('board_refresh_failed', reason=redact(exc))
             if self.controller_paused:
                 self.log.warning('controller_paused', mode=mode,
                                  detail='pause marker present; nothing was executed')
@@ -855,10 +983,88 @@ def _check_names(failures):
     return ', '.join(f'{f.get("name")}({f.get("conclusion")})' for f in failures[:8])
 
 
+#: W4: controller-side retries double from one tick interval and stop at 6 h.
+BACKOFF_CAP_SECONDS = 6 * 3600
+
+
+def _backoff_delay(cfg, attempts):
+    """Seconds to wait before the ``attempts``-th controller-side retry."""
+    interval = max(60, int(cfg.poll_interval_minutes) * 60)
+    return min(interval * 2 ** max(0, int(attempts) - 1), BACKOFF_CAP_SECONDS)
+
+
+def _retry_after(now_iso, delay_seconds):
+    import datetime as dt
+    base = dt.datetime.fromisoformat(now_iso)
+    return (base + dt.timedelta(seconds=delay_seconds)).isoformat(timespec='seconds')
+
+
+def _retry_wait(next_retry_iso, now_iso):
+    """Seconds remaining until ``next_retry_iso``, or None when nothing gates.
+
+    Unparsable or empty timestamps never gate: a broken backoff marker must
+    not become a silent stall -- the tick retries as it always did.
+    """
+    import datetime as dt
+    if not next_retry_iso:
+        return None
+    try:
+        target = dt.datetime.fromisoformat(next_retry_iso)
+        now = dt.datetime.fromisoformat(now_iso)
+    except (TypeError, ValueError):
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    remaining = (target - now).total_seconds()
+    return remaining if remaining > 0 else None
+
+
+def loop_watchdog(database, gh, log, board_issue, threshold=3):
+    """Alert once when ``threshold`` consecutive finished ticks aborted (W4).
+
+    Called by the loop after every tick, healthy or not. On a streak it writes
+    one CRITICAL line -- visible in ``logs/loop.log`` (the loop's stderr) and
+    ``logs/controller.jsonl`` -- and posts exactly one comment on the board
+    issue through the gh layer. Dedupe rides on processed_events and is keyed
+    by ``db.abort_streak``'s anchor, so a continuing stall cannot spam the
+    board and a recovered stall may alert again. A failed post stays unmarked
+    so the next tick retries it. Nothing is ever restarted: the loop is the
+    operator's decision, not the controller's.
+    """
+    count, anchor = db.abort_streak(database)
+    if count < threshold:
+        return False
+    key = f'stall:{anchor}'
+    if db.seen(database, 'loop_stall', key):
+        return False
+    log.critical('loop_stalled',
+                 detail=f'{count} consecutive ticks aborted since run #{anchor}; '
+                        f'the loop process is alive but its ticks fail -- see '
+                        f'event tick_aborted in logs/controller.jsonl')
+    if board_issue:
+        try:
+            gh.post_issue_comment(int(board_issue), (
+                '[mrmap-controller] WATCHDOG: the scheduler loop aborted '
+                f'{count} consecutive ticks (streak after run #{anchor}). The '
+                'loop process keeps running but its ticks fail; inspect the '
+                '"tick_aborted" events in logs/controller.jsonl and the runs '
+                'table of the state database. The controller does not restart '
+                'itself, and this alert is posted once per stall episode.'))
+        except GithubError as exc:
+            log.error('loop_stall_alert_failed', reason=redact(exc))
+            return False                   # unmarked: next tick retries
+    db.mark_events(database, [('loop_stall', key, None, None, 'watchdog')],
+                   utcnow_factory()())
+    return True
+
+
 _EVENT_LEVELS = {
     # Informational outcomes log at INFO; everything an operator should look at
     # logs at WARNING, and a controller-side failure logs at ERROR.
     'NEEDS_HUMAN': 40, 'ABORTED': 40, 'DISPATCH_FAILED': 40, 'INTAKE_BLOCKED': 40,
+    'PR_FOLLOW_FAILED': 40,
     'WOULD_QUARANTINE': 30,
     'SPAWN_UNCERTAIN': 30, 'REJECT': 30, 'DEFER': 30,
 }

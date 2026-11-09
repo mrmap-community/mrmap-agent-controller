@@ -1,10 +1,15 @@
-"""GitHub adapter (read-only, through the existing ``gh`` login).
+"""GitHub adapter (read-only through the existing ``gh`` login, plus one
+explicitly allowed board alert).
 
 Only read endpoints are implemented and the runner refuses any ``gh api`` call
-with an explicit HTTP method or body, so a write through this adapter is not
-possible. Issue dependency relations (native sub-issues, "Blocked by" tasklists
-and blocking links) are deliberately never read: scheduling depends on the human
-approval label alone.
+with an explicit HTTP method or body, so a write through the API is not
+possible. The single exception is :meth:`GitHub.post_issue_comment`: the stall
+watchdog (W4) must reach a human, and it does so with one deduped comment on
+the work board issue. It shells out to ``gh issue comment`` -- every merge,
+review, close, label and api-write command stays denied by the runner, and no
+other call site uses this method. Issue dependency relations (native
+sub-issues, "Blocked by" tasklists and blocking links) are deliberately never
+read: scheduling depends on the human approval label alone.
 """
 import json
 import re
@@ -131,6 +136,21 @@ class GitHub:
                     if comment.get('databaseId') is not None:
                         resolved.add(str(comment['databaseId']))
         return resolved
+
+    # ------------------------------------------------------------ writing ---
+    def post_issue_comment(self, number, body):
+        """Post one comment on an issue -- the watchdog's board alert only.
+
+        ``gh issue comment`` carries no HTTP verb or field, so the runner's
+        deny list still stands for everything else; this is the only write in
+        the adapter and its only intended target is the board issue.
+        """
+        argv = ['gh', 'issue', 'comment', str(number), '--repo',
+                f'{self.owner}/{self.name}', '--body', body]
+        try:
+            self.runner.run(argv)
+        except Exception as exc:
+            raise GithubError(redact(exc)) from exc
 
     # ------------------------------------------------------------ helpers ---
     @staticmethod

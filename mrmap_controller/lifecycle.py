@@ -1,4 +1,4 @@
-"""Controller bookkeeping states.
+"""Controller bookkeeping states and the board refresh that follows them.
 
 These states describe what the controller knows and has done. AO has no matching
 set of native states, so each one is defined by observable facts (GitHub pull
@@ -18,7 +18,17 @@ controller crash-safe: a restart derives the same state from the same facts.
     merged                 pull request merged; claim retired
     failed                 needs a human: retries exhausted, dead session, closed PR
     paused                 "agent: paused" label present; controller is hands off
+
+The one action in this module, :func:`refresh_board`, exists because the work
+board is regenerated only when some ``scripts/wip`` command happens to run: a
+claim the controller moved (spawn, merge-retire, quarantine) is invisible on
+board #917 until then. The board's format and content belong to ``scripts/wip``
+and are duplicated nowhere here -- the controller only invokes it.
 """
+import subprocess
+from pathlib import Path
+
+from .logging_util import redact
 
 QUEUED = 'queued'
 RUNNING = 'running'
@@ -44,3 +54,59 @@ SETTLED = (MERGED, FAILED, READY_FOR_HUMAN_MERGE, PAUSED)
 
 #: AO activity states that consume execution capacity.
 CAPACITY_CONSUMING = 'active working busy running'
+
+
+def board_repository(wip_script):
+    """The checkout ``scripts/wip`` must run inside of, or None when unset.
+
+    ``scripts/wip`` asks git and ``gh`` which repository it is looking at
+    (``git rev-parse --show-toplevel``, ``gh repo view``), and both read the
+    *current directory*. Invoked from the controller's install directory the
+    script cannot see the application repository at all and ``wip board``
+    simply fails. The tool lives at ``<repository>/scripts/wip``, so its
+    repository is the script's own directory's parent.
+    """
+    script = str(wip_script or '')
+    if not script:
+        return None
+    return str(Path(script).resolve().parent.parent)
+
+
+def refresh_board(cfg, log):
+    """Regenerate the ``scripts/wip`` work board after a claim change.
+
+    Called by the tick after any execute-mode pass that moved a claim state
+    (spawn, merge-retire, quarantine), because the board of issue #917 is
+    otherwise only refreshed by ``wip claim/wait/done`` and silently
+    misrepresents reality in between. The board content is entirely
+    ``scripts/wip``'s; this function merely runs ``<wip_script> board`` inside
+    the repository checkout that carries the script (see
+    :func:`board_repository`) and under the configured command timeout.
+
+    Any failure -- missing script, non-zero exit, timeout -- is a WARNING and
+    never touches the tick: a stale board is an annoyance, a lost tick is an
+    incident. Returns True when wip reported a refreshed board.
+    """
+    script = str(cfg.wip_script or '')
+    if not script:
+        log.debug('board_refresh_skipped', detail='wip_script not configured')
+        return False
+    cwd = board_repository(script)
+    if not Path(script).is_file():
+        log.warning('board_refresh_failed',
+                    detail=f'no such wip script: {script}')
+        return False
+    try:
+        proc = subprocess.run([script, 'board'], capture_output=True, text=True,
+                              timeout=cfg.command_timeout_seconds, cwd=cwd)
+    except Exception as exc:
+        log.warning('board_refresh_failed', detail=redact(exc))
+        return False
+    if proc.returncode != 0:
+        log.warning('board_refresh_failed',
+                    detail=redact(f'exit {proc.returncode} in {cwd}: '
+                                  f'{(proc.stdout or "").strip()} '
+                                  f'{(proc.stderr or "").strip()}'))
+        return False
+    log.info('board_refreshed', detail=f'{script} in {cwd}')
+    return True

@@ -58,6 +58,11 @@ class FakeGitHub(Recording):
         self.threads = threads or {}
         self.login = login
         self.fail_on = set()
+        # number -> exception: pr_view raises exactly this for that one pull
+        # request (W4 per-PR isolation tests feed it a sqlite OperationalError).
+        self.pr_view_raises = {}
+        # every watchdog board alert posted during the test
+        self.posted_comments = []
         # Deliberately never read by the controller: native blocking relationships
         # must not influence scheduling. Tests set this to prove it.
         self.blocking_by_issue = {}
@@ -94,8 +99,12 @@ class FakeGitHub(Recording):
         return list(self.pulls)
 
     def pr_view(self, number):
-        self._maybe_fail('pr_view')
         self.note('pr_view', number=number)
+        if number in self.pr_view_raises:
+            # The call genuinely happened and broke controller-side: recorded
+            # first, like a gh command that ran and then failed underneath.
+            raise self.pr_view_raises[number]
+        self._maybe_fail('pr_view')
         if number not in self.prs:
             raise GithubError(f'PR #{number} not in fixture')
         return dict(self.prs[number])
@@ -120,6 +129,13 @@ class FakeGitHub(Recording):
         self.note('pr_resolved_thread_comment_ids', number=number)
         # Same contract as the real adapter: string comment ids.
         return {str(x) for x in self.threads.get(number, set())}
+
+    def post_issue_comment(self, number, body):
+        # The watchdog board alert. No test reaches GitHub through here.
+        self._maybe_fail('post_issue_comment')
+        self.note('post_issue_comment', number=number, body=body)
+        self.posted_comments.append((number, body))
+        return f'posted to #{number}'
 
 
 class FakeAO(Recording):
@@ -273,11 +289,15 @@ class Harness:
         self.execute = execute
         self.capacity_ok = True
         self.pause_file = self.tmp / 'paused'
+        # W5: the harness records board refreshes instead of running wip; no
+        # test may spawn subprocesses against the real repository.
+        self.board_calls = []
 
     def controller(self, execute=None):
         return Controller(self.cfg, self.gh, self.ao, self.conn, self.log,
                           capacity_probe=lambda: self.capacity_ok,
                           pause_file=self.pause_file,
+                          board_refresher=lambda: self.board_calls.append(True),
                           execute=self.execute if execute is None else execute)
 
     def bind(self, gh=None, ao=None):
@@ -328,7 +348,7 @@ class _Capturing:
     def __getattr__(self, name):
         def emit(event, **fields):
             level = {'debug': 10, 'info': 20, 'warning': 30,
-                     'error': 40}.get(name, 20)
+                     'error': 40, 'critical': 50}.get(name, 20)
             self.log(level, event, **fields)
         return emit
 

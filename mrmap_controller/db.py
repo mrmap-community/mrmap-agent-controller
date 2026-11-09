@@ -5,6 +5,14 @@ meaning, no ALTER. Everything the controller adds lives in new tables, so the
 working gatekeeper keeps running against the same file and a fresh install of
 either program produces a usable database.
 
+Schema drift is repaired by :func:`ensure_schema`: after ``CREATE TABLE IF NOT
+EXISTS`` every column this layout expects but the file lacks is added with
+``ALTER TABLE ... ADD COLUMN``. Nothing is ever dropped, renamed or recreated,
+and ``PRAGMA user_version`` stamps which layout a file carries. Without this,
+a pilot-era ``dispatches`` table kept failing every delivery with
+``no such column: attempts`` -- 456 aborted ticks of it (incident 2026-11-06,
+root cause B-3.1).
+
 ``claims`` is the exclusive assignment board -- ``issue`` is the primary key, so
 two inserts for one issue cannot both succeed. ``dispatches.dedupe_key`` is the
 second unique index and is what makes CI and review delivery idempotent.
@@ -46,6 +54,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
     session_id TEXT,
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 1,
+    next_retry_at TEXT,
     created_at TEXT NOT NULL,
     detail TEXT
 );
@@ -96,10 +105,89 @@ def connect(path, durable=True):
     return db
 
 
+#: Layout stamp written to ``PRAGMA user_version``. A file found at 0 is
+#: either pilot-era or first-controller-era; PRAGMA, not the stamp, decides
+#: which ALTERs are actually needed, so a file stamped 0 that already has a
+#: column is repaired without touching that table.
+#:   0: pilot-era / unstamped (no controller guarantee)
+#:   1: controller tables as of the first release (dispatches has ``attempts``)
+#:   2: dispatches gained ``next_retry_at`` (controller-side retry backoff)
+SCHEMA_VERSION = 2
+
+#: Columns introduced after the first controller layout, grouped by the
+#: version that introduced them. This is the ledger :func:`ensure_schema`
+#: consults; the PRAGMA check decides per file which of them are missing.
+ADDITIVE_COLUMNS = {
+    1: {'dispatches': {'attempts': 'INTEGER NOT NULL DEFAULT 1'}},
+    2: {'dispatches': {'next_retry_at': 'TEXT'}},
+}
+
+
+class SchemaVersionError(Exception):
+    """The state database carries a newer layout than this code knows."""
+
+
 def init(db):
     db.execute(CLAIMS_DDL)
     db.executescript(NEW_DDL)
+    ensure_schema(db)
     db.commit()
+
+
+def columns_of(db, table):
+    """Column names of one existing table, in file order ([] when absent)."""
+    return [r['name'] for r in db.execute(f'PRAGMA table_info({table})')]
+
+
+def ensure_schema(db):
+    """Bring an existing database up to the current layout, additively only.
+
+    Generalises :func:`schema_is_legacy_compatible` from a claims-only promise
+    to a checked schema: for every table that exists, each column this layout
+    expects but the file lacks gets an ``ALTER TABLE ... ADD COLUMN`` -- never
+    a drop, never a recreate. Additive columns are invisible to the legacy
+    pilot and to older controller code (inserts name their columns and every
+    added column carries a default), so the repair works while the old loop
+    still runs against the file.
+
+    ``claims`` takes part in the check but never in the repair: its five
+    pilot columns are a contract, enforced by refusing to run
+    (``schema_is_legacy_compatible``), not by ALTERing.
+
+    A file stamped with a *newer* layout than this code knows is refused:
+    half-understanding a schema written by a later controller is how drift
+    becomes silent corruption.
+
+    Returns the list of ``table.column`` additions actually made.
+    """
+    version = db.execute('PRAGMA user_version').fetchone()[0]
+    if version > SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f'state database is stamped schema version {version}, this '
+            f'controller knows at most {SCHEMA_VERSION}; refusing to run '
+            f'against a newer layout')
+    added = []
+    if version >= SCHEMA_VERSION:
+        return added
+    for _target, tables in sorted(ADDITIVE_COLUMNS.items()):
+        for table, columns in sorted(tables.items()):
+            if not columns_of(db, table):
+                continue                    # table absent: NEW_DDL created it whole
+            existing = columns_of(db, table)
+            for name, definition in sorted(columns.items()):
+                if name in existing:
+                    continue
+                try:
+                    db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
+                except sqlite3.OperationalError as exc:
+                    # A concurrent init (one-shot command beside the loop) may
+                    # have added it a moment ago; the PRAGMA settles it.
+                    if name not in columns_of(db, table):
+                        raise exc
+                added.append(f'{table}.{name}')
+    db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+    db.commit()
+    return added
 
 
 def schema_is_legacy_compatible(db):
@@ -216,10 +304,14 @@ def attempt_count(db, pr_number, kinds):
     return row[0]
 
 
-def set_dispatch(db, dedupe_key, status, session_id=None, detail=None):
+def set_dispatch(db, dedupe_key, status, session_id=None, detail=None,
+                 next_retry_at=None):
+    """Set a delivery's outcome. ``next_retry_at`` replaces the previous
+    backoff timestamp outright -- passing None clears it, so a delivered or
+    uncertain dispatch never carries a stale retry gate."""
     db.execute('UPDATE dispatches SET status=?, session_id=COALESCE(?, session_id), '
-               'detail=COALESCE(?, detail) WHERE dedupe_key=?',
-               (status, session_id, detail, dedupe_key))
+               'detail=COALESCE(?, detail), next_retry_at=? WHERE dedupe_key=?',
+               (status, session_id, detail, next_retry_at, dedupe_key))
     db.commit()
 
 
@@ -286,3 +378,24 @@ def last_run(db):
 
 def recent_runs(db, limit=10):
     return db.execute('SELECT * FROM runs ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+
+
+def abort_streak(db):
+    """(count, anchor) of the current run of aborted ticks.
+
+    ``count`` is the runs finished with outcome 'aborted' after the newest
+    run that finished with any other outcome; ``anchor`` is that newer run's
+    id (0 when the ledger holds no such row). The anchor stays stable while a
+    stall continues, which is what makes the watchdog's dedupe key one alert
+    per episode instead of one per arithmetic window.
+    """
+    row = db.execute(
+        '''SELECT COUNT(*) AS n,
+                  (SELECT COALESCE(MAX(id), 0) FROM runs
+                     WHERE outcome IS NOT NULL AND outcome != 'aborted') AS anchor
+           FROM runs
+           WHERE outcome = 'aborted'
+             AND id > (SELECT COALESCE(MAX(id), 0) FROM runs
+                        WHERE outcome IS NOT NULL AND outcome != 'aborted')'''
+    ).fetchone()
+    return row['n'], row['anchor']
