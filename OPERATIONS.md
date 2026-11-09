@@ -456,6 +456,50 @@ is off and was never triggered.
 
 ---
 
+## This repository's own tests and CI
+
+Everything the controller does is testable offline: GitHub and AO are the doubles
+in `tests/fakes.py`, the state database is a temporary file, and the capacity gate
+is stubbed. So the whole suite runs anywhere, in about a minute, with nothing but
+the standard library:
+
+```
+python3 -m unittest discover -s tests -q        # roughly a minute, no network
+```
+
+**CI has never run on this repository.** `.github/workflows/` is empty, and the
+reason is a permission, not an oversight: a workflow runs with the repository's
+permissions, so GitHub refuses to let a personal access token create or update a
+workflow file without an explicit `workflows` permission. Verified on this
+repository through both routes — `git push` (`refusing to allow a Personal Access
+Token to create or update workflow … without workflow scope`) and the contents API
+(`403 Resource not accessible by personal access token`). The definition therefore
+waits at `ci/ci.yml`, reviewed as an ordinary file.
+
+Two consequences a reader should not have to discover the hard way:
+
+- **An empty check list on a pull request here means *no CI ran*, not green.**
+  Until the file is installed, the only evidence on a PR is what a person ran.
+- **What validates a release instead:** the full suite at the exact commit on the
+  deployment host, `compileall`, `doctor` against the live config, and a dry-run
+  tick against a copy of the live state. The record of one such deploy, with the
+  numbers, is `README-DEPLOYMENT.md` in the install directory.
+
+Installing it is one step for a human, either by granting the token *Workflows:
+Read and write* or by committing the file through the web UI:
+
+```
+mkdir -p .github/workflows && cp ci/ci.yml .github/workflows/ci.yml
+```
+
+`tests/test_packaging.py` makes the two copies impossible to diverge: it fails if
+the file under `.github/workflows/` ever differs from the reviewed `ci/ci.yml`,
+and it fails if the definition ever gains a path to production (its `permissions:`
+stay `contents: read`). Activating it cannot therefore install something that was
+not reviewed.
+
+---
+
 ## Limits this build does not remove
 
 - **No auto-merge, no auto-approval, no auto-close.** Not configurable, on
