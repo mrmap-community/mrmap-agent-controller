@@ -294,6 +294,21 @@ def cmd_doctor(args):
         conn.close()
     except SystemExit as exc:
         check('claims table compatible with pilot', False, exc)
+    # A quarantine nobody can interpret is a quarantine nobody will clear, so
+    # the explain path is a precondition, not a nicety. It is probed through the
+    # same wiring `reconcile` uses, on the real claims table: a failure here
+    # means an operator would be reading a traceback instead of a verdict.
+    try:
+        _, _, probe_conn, probe = _reading_controller(args)
+        quarantined = recovery.assess_all(probe)
+        probe_conn.close()
+        unnamed = [v for v in quarantined if v.kind not in recovery.ALL_KINDS]
+        first = quarantined[0] if quarantined else None
+        check('reconcile explains quarantined claims (W8)', not unnamed,
+              f'{len(quarantined)} work item(s) assessed'
+              + (f', first: #{first.issue} {first.kind}' if first else ''))
+    except Exception as exc:
+        check('reconcile explains quarantined claims (W8)', False, exc)
     check('intake lock', Path(cfg.lock_file).parent.exists(), cfg.lock_file)
     wrapper = Path(cfg.docker_test_wrapper)
     check('docker test wrapper', wrapper.is_file() and os.access(wrapper, os.X_OK),
