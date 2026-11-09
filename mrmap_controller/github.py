@@ -178,6 +178,40 @@ class GitHub:
             return None
         return data.get('number')
 
+    def cross_referenced_pulls(self, number):
+        """Pull requests GitHub records as cross-referenced on this issue.
+
+        The timeline's own ``cross-referenced`` events, not a text search: this
+        is what GitHub saw, so a branch or body that merely mentions a number
+        cannot invent a link here either. Used by W8 to say "a merged PR points
+        at this issue" without claiming it delivered anything -- only closing
+        linkage (:meth:`pr_closes_issue`) proves that.
+
+        Returns ``[{number, state, merged}]``. A failed read returns ``[]``:
+        a missing candidate can only make the report quieter, never wrong.
+        """
+        try:
+            pages = self._paginate(f'repos/{self.owner}/{self.name}/issues/{number}'
+                                   f'/timeline?per_page=100')
+        except GithubError:
+            return []
+        found, seen = [], set()
+        for event in pages:
+            if not isinstance(event, dict) or event.get('event') != 'cross-referenced':
+                continue
+            source = (event.get('source') or {}).get('issue') or {}
+            if not isinstance(source, dict) or not source.get('pull_request'):
+                continue
+            pr_number = source.get('number')
+            if not pr_number or pr_number in seen:
+                continue
+            seen.add(pr_number)
+            found.append({'number': pr_number,
+                          'state': (source.get('state') or '').upper(),
+                          'merged': bool((source.get('pull_request') or {})
+                                         .get('merged_at'))})
+        return found
+
     def pr_closes_issue(self, pr_number, issue):
         """True when GitHub's own closing linkage ties this PR to closing that
         issue (W2) -- the closed-references connection that backs the

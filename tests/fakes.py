@@ -47,7 +47,7 @@ class FakeGitHub(Recording):
 
     def __init__(self, issues=None, events=None, pulls=None, prs=None, reviews=None,
                  review_comments=None, issue_comments=None, threads=None, login='mrmap-agent-bot',
-                 closed_links=None, parents=None):
+                 closed_links=None, parents=None, cross_refs=None):
         super().__init__()
         self.issues = issues or []
         self.events = events or {}
@@ -62,6 +62,9 @@ class FakeGitHub(Recording):
         # pr number -> issue numbers GitHub's closing linkage says that PR closed
         # (W2): the closed_references payload of the fakes.
         self.closed_links = closed_links or {}
+        # issue number -> the pull requests GitHub's timeline records as
+        # cross-referenced on that issue (W8's absorbed-work candidates).
+        self.cross_refs = cross_refs or {}
         # issue number -> native sub-issue parent number (W3 epics)
         self.parents = parents or {}
         self.login = login
@@ -105,6 +108,14 @@ class FakeGitHub(Recording):
         self._maybe_fail('open_pulls')
         self.note('open_pulls')
         return list(self.pulls)
+
+    def cross_referenced_pulls(self, number):
+        # The real adapter turns any read failure into [] (a missed candidate can
+        # only make a report quieter, never a wrong action); fail_on gives a test
+        # exactly that behaviour.
+        self.note('cross_referenced_pulls', number=number)
+        self._maybe_fail('cross_referenced_pulls')
+        return list(self.cross_refs.get(number, []))
 
     def pr_view(self, number):
         self.note('pr_view', number=number)
@@ -341,6 +352,17 @@ class Harness:
         collecting, so assertions can use either the report or ``h.log``."""
         self.bind(gh=gh, ao=ao)
         return self.controller(execute=execute).tick()
+
+    def reader(self, gh=None, ao=None, execute=False):
+        """A controller that has read its facts but is not going to act (W8).
+
+        The same wiring ``cli._reading_controller`` builds, so a test of
+        reconcile/recover exercises the same path the command does.
+        """
+        self.bind(gh=gh, ao=ao)
+        controller = self.controller(execute=execute)
+        controller.load_facts()
+        return controller
 
     def claim(self, issue, state='spawned', session_id=None, note='', age_minutes=0):
         db.claim_issue(self.conn, issue, state, now(-age_minutes), note,

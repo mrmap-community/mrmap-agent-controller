@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from . import __version__, ao as ao_mod, config as config_mod, db, github as gh_mod
+from . import recovery
 from .core import Controller, claim_holds, loop_watchdog
 from .logging_util import redact, setup
 from .runner import Runner, assert_allowed
@@ -408,6 +409,76 @@ def cmd_release(args):
         lock.close()
 
 
+def _reading_controller(args):
+    """A controller wired to read, not to act: execute=False, facts loaded.
+
+    Reconcile and recover need the same facts a tick sees, gathered the same way.
+    Building them here instead of re-reading GitHub and AO by hand is what keeps
+    the explanation from ever disagreeing with the tick's own decision.
+    """
+    cfg, log = build(args)
+    conn = open_db(cfg, log)
+    runner = controller_runner(cfg, log)
+    controller = Controller(cfg, gh_mod.GitHub(runner, cfg.repo),
+                            ao_mod.AO(runner, cfg.ao_project,
+                                      timeout=cfg.command_timeout_seconds),
+                            conn, log, pause_file=PAUSE_MARKER, execute=False)
+    controller.load_facts()
+    return cfg, log, conn, controller
+
+
+def cmd_reconcile(args):
+    """W8: say what each claimed work item actually is. Prints only."""
+    cfg, log, conn, controller = _reading_controller(args)
+    try:
+        issues = [args.issue] if args.issue else None
+        verdicts = recovery.assess_all(controller, issues,
+                                       include_merged=args.all)
+    finally:
+        conn.close()
+    if args.json:
+        print(json.dumps([v.as_dict() for v in verdicts], indent=2, sort_keys=True))
+        return 0
+    print(f'MrMap Agent Controller {__version__} reconcile -- {cfg.repo} '
+          f'({getattr(cfg, "_source", "defaults")})')
+    print(recovery.report(verdicts, explain=args.explain))
+    print('\nNothing was changed. Every action shown is a command a human runs; '
+          '`recover` is the one the controller performs itself, and only with '
+          '--confirm, and only for a session that is merely asleep.')
+    return 0
+
+
+def cmd_recover(args):
+    """W8: wake one sleeping worker. The smallest action a verdict allows."""
+    if not args.confirm:
+        print(f'Refusing: waking a session starts consuming capacity and continues '
+              f'work on #{args.issue}. Re-run with --confirm, or run '
+              f'"mrmap-controller reconcile --issue {args.issue} --explain" first.')
+        return 2
+    cfg, log = build(args)
+    lock = exclusive_lock(cfg, log)
+    if lock is None:
+        print('The intake lock is held by a running tick; waking a worker while a '
+              'tick decides about the same issue is exactly the race to avoid.')
+        return 1
+    conn = open_db(cfg, log)
+    try:
+        runner = controller_runner(cfg, log)
+        controller = Controller(cfg, gh_mod.GitHub(runner, cfg.repo),
+                                ao_mod.AO(runner, cfg.ao_project,
+                                          timeout=cfg.command_timeout_seconds),
+                                conn, log, pause_file=PAUSE_MARKER, execute=True)
+        controller.load_facts()
+        done, message = recovery.recover(controller, args.issue, confirm=True)
+        log.warning('recover_attempted', issue=args.issue, detail=redact(message),
+                    done=done)
+        print(message)
+        return 0 if done else 1
+    finally:
+        conn.close()
+        lock.close()
+
+
 def cmd_reconcile_closing(args):
     """W2: list merged-PR-with-still-open-issue pairs as a human action list.
 
@@ -643,6 +714,25 @@ def build_parser():
         'reconcile-closing',
         help='list merged PRs whose issue is still open (prints only, W2)')
     closing.set_defaults(func=cmd_reconcile_closing)
+
+    reconcile = sub.add_parser(
+        'reconcile',
+        help='explain what each claimed work item actually is (prints only, W8)')
+    reconcile.add_argument('--issue', type=int,
+                           help='one issue number (default: every claim at rest)')
+    reconcile.add_argument('--explain', action='store_true',
+                           help='print the evidence behind each verdict')
+    reconcile.add_argument('--all', action='store_true',
+                           help='include claims already retired as merged')
+    reconcile.add_argument('--json', action='store_true')
+    reconcile.set_defaults(func=cmd_reconcile)
+
+    recover = sub.add_parser(
+        'recover',
+        help='wake one sleeping worker after an ownership check (needs --confirm)')
+    recover.add_argument('issue', type=int)
+    recover.add_argument('--confirm', action='store_true')
+    recover.set_defaults(func=cmd_recover)
 
     pause = sub.add_parser('pause', help='make every tick report-only')
     pause.add_argument('reason', nargs='?')
