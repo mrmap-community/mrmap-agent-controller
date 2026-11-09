@@ -21,6 +21,7 @@
   "capacity_script": "/home/ota/agent-orchestrator-test/mrmap/scripts/agent_capacity",
   "wip_script": "/home/ota/agent-orchestrator-test/mrmap/scripts/wip",
   "board_issue": 917,
+  "questions_enabled": "report-only",
   "count_foreign_workers": true,
   "allow_restore_terminated": false,
   "use_thread_resolution": true,

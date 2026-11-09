@@ -1,0 +1,47 @@
+[
+  {
+    "id": "IC_kwDOFKaso88AAAABjCiZvQ",
+    "author": {
+      "login": "jokiefer"
+    },
+    "authorAssociation": "MEMBER",
+    "body": "<!-- agent-claim {\"v\":1,\"client\":\"519ca074bf12:mrmap\",\"issue\":831,\"branch\":\"master\",\"worktree\":\"/home/ota/src/mrmap\",\"state\":\"done\",\"since\":\"2026-11-05T00:47:09Z\",\"heartbeat\":\"2026-11-05T09:51:01Z\",\"released\":\"2026-11-05T09:51:01Z\"} -->\n\n✅ **Released** — was claimed by `519ca074bf12:mrmap`\n\n- branch: `master`\n- worktree: `/home/ota/src/mrmap`\n- since: 2026-11-05T00:47:09Z\n- released: 2026-11-05T09:51:01Z\n",
+    "createdAt": "2026-11-05T00:47:54Z",
+    "includesCreatedEdit": true,
+    "isMinimized": false,
+    "minimizedReason": "",
+    "reactionGroups": [],
+    "url": "https://github.com/mrmap-community/mrmap/issues/831#issuecomment-6646438333",
+    "viewerDidAuthor": false
+  },
+  {
+    "id": "IC_kwDOFKaso88AAAABkJrXmw",
+    "author": {
+      "login": "mrmap-agent-bot"
+    },
+    "authorAssociation": "MEMBER",
+    "body": "<!-- agent-claim {\"v\":1,\"client\":\"519ca074bf12:mrmap-70\",\"issue\":831,\"branch\":\"feature/issue-831-application-records-frontend\",\"worktree\":\"/home/ota/.ao/data/worktrees/mrmap/mrmap-70\",\"state\":\"waiting\",\"since\":\"2026-11-08T11:40:26Z\",\"heartbeat\":\"2026-11-08T12:09:50Z\",\"released\":null,\"question\":\"Adoption of PR #1048 is complete locally and fully green, but it cannot...\"} -->\n\n⏸ **Needs user input** — claimed by `519ca074bf12:mrmap-70`\n\n- branch: `feature/issue-831-application-records-frontend`\n- worktree: `/home/ota/.ao/data/worktrees/mrmap/mrmap-70`\n- since: 2026-11-08T11:40:26Z\n- waiting for: Adoption of PR #1048 is complete locally and fully green, but it cannot...\n- last heartbeat: 2026-11-08T12:09:50Z (now ago)\n",
+    "createdAt": "2026-11-08T11:41:16Z",
+    "includesCreatedEdit": true,
+    "isMinimized": false,
+    "minimizedReason": "",
+    "reactionGroups": [],
+    "url": "https://github.com/mrmap-community/mrmap/issues/831#issuecomment-6721034139",
+    "viewerDidAuthor": true
+  },
+  {
+    "id": "IC_kwDOFKaso88AAAABkJ8duw",
+    "author": {
+      "login": "mrmap-agent-bot"
+    },
+    "authorAssociation": "MEMBER",
+    "body": "<!-- agent-question client=519ca074bf12:mrmap-70 id=0b014d9f -->\n\n🙋 **Question for the user** — asked by `519ca074bf12:mrmap-70` (id `0b014d9f`)\n\nAdoption of PR #1048 is complete locally and fully green, but it cannot be pushed: the 'feature/**' ruleset (id 26682018, created 2026-11-06, one day after this branch's last push) requires verified commit signatures. The master-merge needed to resolve the PR's conflicts introduces 174 unsigned commits as new-to-ref (mine plus master's already-landed unsigned ones), and GH013 rejects the push. No commit is rewritten and none can be signed by an agent; the ruleset has no bypass actors. Options for a person: (a) add a bypass to ruleset 26682018 for the adopting actor or this branch, (b) have a maintainer push the de-conflicting merge from the prepared local branch (feature/issue-831-application-records-frontend at 34e110726: merge of current master with semantic conflict resolutions + fixes for both Sonar findings; verified: frontend lint/type-check/full vitest 161 files, pre_commit_check, application-record+query-performance Django tests, Behave T3 78/602/3938 all green), or (c) decide a lineage change (e.g. re-head the PR to a branch outside the protected patterns, keeping the existing history). Which of these is the right act, and who performs it?\n",
+    "createdAt": "2026-11-08T12:10:38Z",
+    "includesCreatedEdit": false,
+    "isMinimized": false,
+    "minimizedReason": "",
+    "reactionGroups": [],
+    "url": "https://github.com/mrmap-community/mrmap/issues/831#issuecomment-6721314235",
+    "viewerDidAuthor": true
+  }
+]
