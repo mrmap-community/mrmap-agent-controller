@@ -1,15 +1,18 @@
 name: CI
 
-# WHERE THIS BELONGS, AND WHY IT IS SITTING HERE.
-# GitHub refuses to let this repository's bot token create or update anything
-# under .github/workflows: a workflow is code that runs with the repository's
-# permissions, and the token behind the agent has no "workflows" scope. That is
-# a reasonable boundary, so it is kept: a human activates this file with
+# WHERE THIS BELONGS.
+# This file is the reviewed source; .github/workflows/ci.yml is the copy GitHub
+# executes. tests/test_packaging.py fails if the two ever differ byte for byte,
+# so what runs cannot drift from what a person read, and it fails if either copy
+# gains a way to reach the deployment.
 #
-#     mkdir -p .github/workflows && cp ci/ci.yml .github/workflows/ci.yml
-#
-# tests/test_packaging.py fails if the copy in .github/ and this one ever differ,
-# so activating it cannot leave two versions behind.
+# The duplication is deliberate and stays. Until 2026-11-09 this repository's
+# token had no "workflows" permission -- GitHub withholds that from a personal
+# access token because a workflow is code that runs with the repository's
+# permissions -- so the definition had to be written and reviewed as an ordinary
+# file before anything could execute it. The permission has since been granted,
+# and the guard is worth more than the file it duplicates, so the two-copy
+# arrangement is kept on purpose rather than collapsed.
 #
 # Everything the controller tests is offline: GitHub and AO are the doubles in
 # tests/fakes.py, the state database is a temporary file, and the capacity gate

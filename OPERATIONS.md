@@ -467,36 +467,33 @@ the standard library:
 python3 -m unittest discover -s tests -q        # roughly a minute, no network
 ```
 
-**CI has never run on this repository.** `.github/workflows/` is empty, and the
-reason is a permission, not an oversight: a workflow runs with the repository's
-permissions, so GitHub refuses to let a personal access token create or update a
-workflow file without an explicit `workflows` permission. Verified on this
-repository through both routes — `git push` (`refusing to allow a Personal Access
-Token to create or update workflow … without workflow scope`) and the contents API
-(`403 Resource not accessible by personal access token`). The definition therefore
-waits at `ci/ci.yml`, reviewed as an ordinary file.
-
-Two consequences a reader should not have to discover the hard way:
-
-- **An empty check list on a pull request here means *no CI ran*, not green.**
-  Until the file is installed, the only evidence on a PR is what a person ran.
-- **What validates a release instead:** the full suite at the exact commit on the
-  deployment host, `compileall`, `doctor` against the live config, and a dry-run
-  tick against a copy of the live state. The record of one such deploy, with the
-  numbers, is `README-DEPLOYMENT.md` in the install directory.
-
-Installing it is one step for a human, either by granting the token *Workflows:
-Read and write* or by committing the file through the web UI:
-
-```
-mkdir -p .github/workflows && cp ci/ci.yml .github/workflows/ci.yml
-```
-
+**CI runs on this repository since 2026-11-09.** The definition is authored at
+`ci/ci.yml` and installed at `.github/workflows/ci.yml`, and
 `tests/test_packaging.py` makes the two copies impossible to diverge: it fails if
-the file under `.github/workflows/` ever differs from the reviewed `ci/ci.yml`,
-and it fails if the definition ever gains a path to production (its `permissions:`
-stay `contents: read`). Activating it cannot therefore install something that was
-not reviewed.
+the file under `.github/workflows/` ever differs from the reviewed `ci/ci.yml`
+byte for byte, and fails if the definition gains a path to production (its
+`permissions:` stay `contents: read`). So the copy GitHub executes cannot drift
+from the copy a person reviewed, and no green check can install or start anything.
+
+Why the file exists twice: a workflow runs with the repository's permissions, so
+GitHub refuses to let a personal access token create or update anything under
+`.github/workflows/` without an explicit `workflows` permission. This repository's
+token did not have it until 2026-11-09, which is why the definition was first
+authored and reviewed as an ordinary file. Both routes were tried and refused
+before the grant — `git push` (`refusing to allow a Personal Access Token to
+create or update workflow … without workflow scope`) and the contents API (`403
+Resource not accessible by personal access token`). The permission has since been
+granted; the duplication stays because the guard is worth more than the file it
+duplicates.
+
+**Reading the history of a pull request.** Before 2026-11-09 nothing here was ever
+run by CI, so an empty check list on an older pull request means *no CI ran*, not
+green — that includes #11 through #17. The evidence for those merges is the release
+record instead: the full suite at the exact commit on the deployment host,
+`compileall`, `doctor` against the live config, and a dry-run tick against a copy
+of the live state, with the numbers written up in `README-DEPLOYMENT.md` in the
+install directory. CI checks add to that record; they do not replace it, because a
+runner cannot reach the deployment host by design.
 
 ---
 

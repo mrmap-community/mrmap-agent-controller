@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import subprocess
+import tempfile
 import unittest
 
 from mrmap_controller import config as config_mod
@@ -34,7 +35,23 @@ class ExampleConfiguration(unittest.TestCase):
 
     def test_the_documented_example_passes_the_validator(self):
         cfg = config_mod.Config(dict(config_mod.DEFAULTS, **self.raw))
-        config_mod._validate(cfg)          # must not raise
+        try:
+            config_mod._validate(cfg)          # must not raise
+        except config_mod.ConfigError as exc:
+            # Exactly one rule in the validator is about the machine rather than
+            # the file: the state database's directory has to exist, and the
+            # example names the deployment host's directory, which exists only
+            # there. Anything else the validator objects to is a real failure --
+            # and re-raising here is the point, because "the example validates
+            # everywhere except where it is installed" is how an example stops
+            # being an example without anyone noticing.
+            if 'state_db parent directory missing' not in str(exc):
+                raise
+            # Prove the rest of it holds by validating the same values with a
+            # state database that does exist here.
+            with tempfile.TemporaryDirectory() as tmp:
+                here = dict(self.raw, state_db=str(pathlib.Path(tmp) / 'state.sqlite3'))
+                config_mod._validate(config_mod.Config(dict(config_mod.DEFAULTS, **here)))
 
     def test_the_example_names_every_known_key_and_no_other(self):
         # install.sh copies this file verbatim, so an unknown key is a silent
