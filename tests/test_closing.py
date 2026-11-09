@@ -1,11 +1,17 @@
 """W2: closing-keyword reconciliation.
 
 Three surfaces, all offline: the spawn prompt must demand the real closing
-keyword; the merge path must trust GitHub's closing linkage (the closed-
-references payload the fakes serve) and, when it did not fire, ask the human
-exactly once -- the controller closes nothing; and ``reconcile-closing``
-prints the human action list without mutating anything.
+keyword; the merge path must trust GitHub's closing linkage (the
+``closingIssuesReferences`` connection) and, when it did not fire, ask the human
+exactly once -- the controller closes nothing; and ``reconcile-closing`` prints
+the human action list without mutating anything.
+
+The payloads here name the GraphQL field literally on purpose: the first
+version of this file served the field the code *assumed* (``closedIssues``), so
+every test passed and the first real merge in production failed. See
+``AgainstTheRealSchema``, which asks GitHub's schema instead of a fixture.
 """
+import inspect
 import io
 import json
 import unittest
@@ -14,6 +20,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from mrmap_controller import cli, db, github as gh_mod, lifecycle as st
+from mrmap_controller import runner as runner_mod
 from mrmap_controller.messages import build_spawn_prompt
 from tests import fakes
 from tests.fakes import Harness, approved_issue, pr
@@ -168,34 +175,149 @@ class MergeWithoutClosureAsksOnce(unittest.TestCase):
 
 
 class ClosingLinkageAdapter(unittest.TestCase):
-    """pr_closes_issue reads GitHub's closed-references GraphQL connection
-    through the deny-listed runner -- never a prose grep."""
+    """pr_closes_issue reads GitHub's closing linkage through the deny-listed
+    runner -- never a prose grep.
+
+    The payloads below are hand-written and deliberately name the GraphQL field
+    literally instead of importing the constant the code reads. A fixture that
+    builds its key from the same constant as the parser can only ever confirm
+    the code's own assumption: that is exactly how ``closedIssues`` survived
+    291 green tests and then failed on the first real merge in production.
+    """
 
     def runner(self, payload):
         key = ' '.join(['gh', 'api', 'graphql', '-f', 'owner=o', '-f', 'name=n',
                         '-F', 'number=995',
-                        '-f', f'query={gh_mod.CLOSED_ISSUES_QUERY}'])
+                        '-f', f'query={gh_mod.CLOSING_LINKAGE_QUERY}'])
         return fakes.FakeRunner(responses={key: json.dumps(payload)})
 
     def gh(self, payload):
         return gh_mod.GitHub(self.runner(payload), 'o/n')
 
     def test_closed_reference_matches(self):
-        gh = self.gh({'data': {'repository': {'pullRequest': {'closedIssues': {
-            'nodes': [{'number': 981, 'state': 'CLOSED'}]}}}}})
+        gh = self.gh({'data': {'repository': {'pullRequest': {
+            'closingIssuesReferences': {'nodes': [
+                {'number': 981, 'state': 'CLOSED', 'stateReason': 'COMPLETED'}]}}}}})
         self.assertTrue(gh.pr_closes_issue(995, 981))
 
     def test_nothing_closed_or_only_mention_is_false(self):
-        empty = {'data': {'repository': {'pullRequest': {'closedIssues':
+        empty = {'data': {'repository': {'pullRequest': {'closingIssuesReferences':
                                                             {'nodes': []}}}}}
         self.assertFalse(self.gh(empty).pr_closes_issue(995, 981))
-        other = {'data': {'repository': {'pullRequest': {'closedIssues': {
+        other = {'data': {'repository': {'pullRequest': {'closingIssuesReferences': {
             'nodes': [{'number': 1074, 'state': 'CLOSED'}]}}}}}
         self.assertFalse(self.gh(other).pr_closes_issue(995, 981))
 
     def test_unexpected_shape_fails_closed(self):
         with self.assertRaises(gh_mod.GithubError):
             self.gh({'data': {}}).pr_closes_issue(995, 981)
+
+    def test_errors_payload_is_not_read_as_nothing_closed(self):
+        """A rejected query is not the same answer as a PR that closes nothing.
+
+        Reading ``errors`` as an empty node list would report "no ask needed"
+        every time the fact source is broken -- which is precisely how the
+        ``closedIssues`` typo stayed invisible.
+        """
+        gh = self.gh({'errors': [{'message':
+                                  "Field 'closedIssues' doesn't exist on type "
+                                  "'PullRequest'"}]})
+        with self.assertRaises(gh_mod.GithubError) as caught:
+            gh.pr_closes_issue(995, 981)
+        self.assertIn('closedIssues', str(caught.exception))
+
+    def test_query_sends_the_field_the_parser_reads(self):
+        """The query text and the response path may not name different fields.
+
+        The fixture above pins the parse side; this pins the query that is
+        actually sent, so a rename in one of the two fails here rather than in
+        production.
+        """
+        self.assertIn(gh_mod.PR_CLOSING_FIELD, gh_mod.CLOSING_LINKAGE_QUERY)
+        self.assertNotIn('closedIssues(', gh_mod.CLOSING_LINKAGE_QUERY)
+
+
+class ClosingLinkageAskWording(unittest.TestCase):
+    """The one comment the controller posts must say what it checked.
+
+    Not a style preference: this comment is the only place where the operator
+    learns that a merged PR's issue is still re-dispatchable, and it has to be
+    actionable without reading source.
+    """
+
+    def test_ask_names_the_linkage_that_failed(self):
+        from mrmap_controller import core as core_mod
+        source = inspect.getsource(core_mod.Controller._reconcile_closing)
+        self.assertIn('closing linkage did not fire', source)
+        self.assertIn('does not close issues itself', source)
+
+
+class FieldProbe(unittest.TestCase):
+    """closing_linkage_field_supported: the schema, not a fixture, decides.
+
+    The envelope is ``gh``'s, not GitHub's: ``gh api graphql`` answers inside
+    ``data`` for every query. Getting that wrong is a GithubError, not a False,
+    so a misread probe cannot pass as "the field is missing".
+    """
+
+    def probe(self, payload):
+        key = ' '.join(['gh', 'api', 'graphql', '-f',
+                        f'query={gh_mod.FIELD_PROBE_QUERY}'])
+        return gh_mod.GitHub(fakes.FakeRunner(
+            responses={key: json.dumps(payload)}), 'o/n')
+
+    def test_reports_the_field_the_adapter_uses(self):
+        fields = [{'name': n} for n in
+                  ('closed', 'closedAt', gh_mod.PR_CLOSING_FIELD, 'viewerCanClose')]
+        self.assertTrue(self.probe({'data': {'__type': {'fields': fields}}})
+                        .closing_linkage_field_supported())
+
+    def test_missing_field_is_false_not_an_error(self):
+        fields = [{'name': n} for n in ('closed', 'closedAt', 'title')]
+        self.assertFalse(self.probe({'data': {'__type': {'fields': fields}}})
+                         .closing_linkage_field_supported())
+
+    def test_wrong_envelope_raises_instead_of_denying(self):
+        gh = self.probe({'__type': {'fields': [{'name': gh_mod.PR_CLOSING_FIELD}]}})
+        with self.assertRaises(gh_mod.GithubError):
+            gh.closing_linkage_field_supported()
+
+    def test_rejected_probe_raises(self):
+        gh = self.probe({'errors': [{'message': 'no schema access'}]})
+        with self.assertRaises(gh_mod.GithubError):
+            gh.closing_linkage_field_supported()
+
+
+class AgainstTheRealSchema(unittest.TestCase):
+    """Ask GitHub's live schema whether the field exists.
+
+    The whole point of this file's first rule: no fake can tell us the field is
+    wrong, because the fake is written from the same belief as the code. On a
+    host with credentials this is one request, and it answers with the schema
+    itself -- it earned its place by catching a second mistake (``gh``'s data
+    envelope) that every offline test agreed with.
+
+    It skips when the host cannot answer (no gh, no login) and fails when the
+    host can answer and the answer is wrong. A skip that hides a defect and a
+    green that hides a defect are the same outcome, so the precondition is
+    authentication, not success.
+    """
+
+    def setUp(self):
+        import shutil
+        import subprocess
+        if not shutil.which('gh'):
+            self.skipTest('no gh on this host')
+        if subprocess.run(['gh', 'auth', 'status'],
+                          capture_output=True).returncode != 0:
+            self.skipTest('gh is not authenticated on this host')
+        self.gh = gh_mod.GitHub(runner_mod.Runner(), 'mrmap-community/mrmap')
+
+    def test_closing_linkage_field_exists_upstream(self):
+        self.assertTrue(
+            self.gh.closing_linkage_field_supported(),
+            f'{gh_mod.PR_CLOSING_FIELD} is not readable as a field on PullRequest: '
+            'no merged PR can be checked against its issue, and doctor must say so')
 
 
 class ReconcileClosingCommand(unittest.TestCase):

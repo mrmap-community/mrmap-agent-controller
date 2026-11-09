@@ -34,18 +34,34 @@ query($owner:String!,$name:String!,$number:Int!){
   }
 }'''
 
-#: The REAL closing linkage: issues GitHub closed because the PR body carried a
-#: closing keyword and the PR merged. This is the ``closed #N`` line in the
-#: merge box (the closed-references connection); prose that merely mentions an
-#: issue number never appears here.
-CLOSED_ISSUES_QUERY = '''
+#: The GraphQL field that carries the closing linkage on a PullRequest.
+#: Named once, here, because the name is not free to invent: ``closedIssues``
+#: was the first guess and GitHub rejected it on the first real use in
+#: production ("Field 'closedIssues' doesn't exist on type 'PullRequest'"), so
+#: the ask never fired. Schema introspection on 2026-11-09 lists exactly one
+#: field of this kind on PullRequest -- ``closingIssuesReferences`` -- and
+#: ``doctor`` re-checks it against the live schema, because a fixture can only
+#: ever confirm the assumption the code already made.
+PR_CLOSING_FIELD = 'closingIssuesReferences'
+
+#: The REAL closing linkage: issues GitHub ties to this PR through a closing
+#: keyword, which is what closes them when the PR merges. Prose that merely
+#: mentions an issue number never appears here -- that is the #981/#995 pattern.
+#: ``state`` is part of the payload because the question is never "was this
+#: referenced" but "is the issue still open after the merge".
+CLOSING_LINKAGE_QUERY = '''
 query($owner:String!,$name:String!,$number:Int!){
   repository(owner:$owner,name:$name){
     pullRequest(number:$number){
-      closedIssues(first:50){nodes{number state}}
+      closingIssuesReferences(first:50){nodes{number state stateReason}}
     }
   }
 }'''
+
+#: Introspection, not data: asks the live schema which fields PullRequest has.
+#: No repository, no pull request, no bot-authored fixture, so it cannot agree
+#: with a wrong query the way a fake response does.
+FIELD_PROBE_QUERY = '{__type(name:"PullRequest"){fields{name}}}'
 
 
 class GithubError(Exception):
@@ -216,7 +232,7 @@ class GitHub:
         """True when GitHub's own closing linkage ties this PR to closing that
         issue (W2) -- the closed-references connection that backs the
         ``closes #N`` line in the merge box, read through the GraphQL
-        ``closedIssues`` field.
+        ``closingIssuesReferences`` field.
 
         This is deliberately not a ``#N`` grep of title or body: prose that
         only mentions an issue (the #981/#995 pattern) never appears here, so
@@ -225,10 +241,12 @@ class GitHub:
         """
         argv = ['gh', 'api', 'graphql', '-f', f'owner={self.owner}',
                 '-f', f'name={self.name}', '-F', f'number={pr_number}',
-                '-f', f'query={CLOSED_ISSUES_QUERY}']
+                '-f', f'query={CLOSING_LINKAGE_QUERY}']
         data = self._json(argv)
+        self._raise_on_graphql_error(data, f'closing linkage of PR #{pr_number}')
         try:
-            nodes = data['data']['repository']['pullRequest']['closedIssues']['nodes']
+            nodes = data['data']['repository']['pullRequest'][
+                PR_CLOSING_FIELD]['nodes']
         except (KeyError, TypeError):
             raise GithubError(f'unexpected closed-issues payload for PR #{pr_number}') \
                 from None
@@ -239,6 +257,41 @@ class GitHub:
                     and (node.get('state') or '').upper() == 'CLOSED':
                 return True
         return False
+
+    def closing_linkage_field_supported(self):
+        """True when the live GraphQL schema still has the field this adapter
+        reads, False when it does not -- a renamed or invented field is exactly
+        the failure this module already lived through once in production.
+
+        Raises :class:`GithubError` when the schema cannot be asked at all:
+        ``doctor`` must report "could not check" rather than pass on silence.
+        """
+        data = self._json(['gh', 'api', 'graphql', '-f', f'query={FIELD_PROBE_QUERY}'])
+        self._raise_on_graphql_error(data, 'PullRequest schema introspection')
+        try:
+            # ``gh api graphql`` always answers inside a "data" envelope, so the
+            # probe path is not the query's shape -- learned from the live test,
+            # which is the only reason anyone would know it without guessing.
+            names = [f['name'] for f in data['data']['__type']['fields']
+                     if isinstance(f, dict)]
+        except (KeyError, TypeError):
+            raise GithubError('unexpected schema introspection payload') from None
+        return PR_CLOSING_FIELD in names
+
+    def _raise_on_graphql_error(self, data, what):
+        """A GraphQL error is not an empty answer.
+
+        ``gh`` exits non-zero on a schema error and the runner already turns
+        that into a GithubError; this covers the milder shape where the request
+        came back with an ``errors`` payload. Reading that as "no closing
+        references" would mean "nothing to tell a human", which is how a broken
+        fact source stays invisible.
+        """
+        errors = data.get('errors') if isinstance(data, dict) else None
+        if errors:
+            first = errors[0] if isinstance(errors, list) else errors
+            message = first.get('message') if isinstance(first, dict) else first
+            raise GithubError(f'{what}: {message}')
 
     # ------------------------------------------------------------ writing ---
     def post_issue_comment(self, number, body):

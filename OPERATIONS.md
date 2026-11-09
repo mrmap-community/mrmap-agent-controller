@@ -215,11 +215,18 @@ prose `( #N )` mention never closes an issue and is now only ever the DB-labelin
 fallback.
 
 On every merge observation the controller reads GitHub's **real closing
-linkage** (`closedIssues`, the closed-references connection behind the merge
-box's "closes #N" line). If the linkage did not fire and the issue is still
+linkage** (`closingIssuesReferences`, the connection behind the merge box's
+"closes #N" line). If the linkage did not fire and the issue is still
 open, it posts **exactly one** comment on the issue naming the merged PR and
 asking the human to close — the #981/#995 pattern made visible instead of
 silently re-dispatchable. The controller never closes issues itself.
+
+`doctor` verifies that this field exists in GitHub's live schema
+(*closing linkage is readable (W2)*). It belongs there and not only in the test
+suite because no offline test can catch a field name the tests themselves got
+wrong: the first version asked for `closedIssues`, which GitHub has never had, so
+every test agreed and the first real merge logged `closing_linkage_unreadable`.
+A field name is a host contract, and host contracts are what `doctor` checks.
 
 `bin/mrmap-controller reconcile-closing` prints the current human action list —
 every claim retired as `merged` whose GitHub issue is still open — and mutates
