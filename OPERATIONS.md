@@ -36,7 +36,7 @@ action counts — that ledger is what proved the November incident, keep it.
 | `<state_dir>/loop.lock` | flock taken by every `loop` — a second loop refuses to start (W4) |
 | `state/intake.lock` | the pilot's intake lock; shared, so a gatekeeper tick and a controller tick never overlap |
 | `backups/` | consistent `sqlite3 .backup` snapshots (`0600`) plus the W0 `state-before-W1.sqlite3` and the `pre-fixes-2026-11-09/` tar snapshot |
-| `logs/controller.jsonl` | structured events, rotated; the loop's own stdout/stderr go to `logs/loop.log` |
+| `logs/controller.jsonl` | structured events, rotated; the loop's own stdout/stderr go to the file it was started with — `logs/loop.out` since the release-directory deploys, `logs/loop.log` before them (both still on disk, the older one last written 2026-11-09 16:15) |
 | `paused` | pause marker (created by `pause`, removed by `resume`) |
 | `run/controller.pid` | pidfile of the detached loop (advisory; the flock enforces) |
 | `bin/mrmap-controller` | entry point: exports `MRMAP_CONTROLLER_CONFIG` and `PYTHONPATH`, execs `python3 -m mrmap_controller.cli` |
@@ -130,43 +130,56 @@ pilot's `claims` table is byte-identical after a dry run, which
 ### Loop start (verified — this is what actually runs here)
 
 The loop process actually running was inspected through `/proc` on 2026-11-09
-(pid `2489101`, recorded in `run/controller.pid`). Its real shape:
+at 18:17 UTC, after the second release went live. Its real shape:
 
 | Fact | Value |
 | --- | --- |
-| Command line | `/usr/bin/python3 -m mrmap_controller.cli loop --write-pidfile` |
+| Command line | `python3 -m mrmap_controller.cli loop --write-pidfile` |
 | Interpreter | `/usr/bin/python3` (Python 3.13) |
-| Working directory | `/home/ota/.ao/mrmap-controller` |
-| stdout / stderr | both `logs/loop.log` (JSON lines from the stderr handler land here) |
-| Start | `Fri Nov 6 15:37:01 2026`, detached (`setsid`, parent pid 1) |
+| Working directory | `/home/ota/.ao/mrmap-controller/releases/2026-11-09-29c0f93` |
+| `MRMAP_CONTROLLER_CONFIG` | that release's `config.json`, itself a symlink to the install root's |
+| `PYTHONPATH` | the same release directory, from `bin/mrmap-controller` |
+| stdout / stderr | both `/home/ota/.ao/mrmap-controller/logs/loop.out` (absolute, see below) |
+| Detachment | own process group and session, no tty, SIGHUP ignored |
 | systemd | not a unit — this host has no systemd user bus; `systemd/*.unit` files are inert |
 
-Behaviour-relevant environment (non-secret values, read from
-`/proc/2489101/environ`):
+The working directory is a release, not the install root: the install root holds
+`config.json`, `logs/`, `backups/` and `releases/`, and `current` is a symlink to
+whichever release runs. That is what makes a rollback a repoint. Secret-looking
+environment values are deliberately not recorded here.
 
-- `MRMAP_CONTROLLER_CONFIG=/home/ota/.ao/mrmap-controller/config.json`
-- `PYTHONPATH=/home/ota/.ao/mrmap-controller` (present twice: the wrapper appends
-  it to an already-set value)
-- Everything else is inherited from the operator's login shell; secret-looking
-  values are deliberately not recorded here.
-
-The verified restart sequence — after `bin/mrmap-controller stop` confirmed the
-old loop is gone — is:
+The verified restart sequence — after `bin/mrmap-controller stop` confirmed from
+the same `current` that the old loop is gone:
 
 ```bash
-cd /home/ota/.ao/mrmap-controller
-setsid ./bin/mrmap-controller loop --write-pidfile >> logs/loop.log 2>&1 &
+cd /home/ota/.ao/mrmap-controller/current
+setsid nohup bin/mrmap-controller loop --write-pidfile \
+    >> /home/ota/.ao/mrmap-controller/logs/loop.out 2>&1 &
 ```
 
-which is exactly what `bin/mrmap-controller start` reproduces (it adds
-`--dry-run` when `config.json` says `dry_run: true`). To activate without
-`--dry-run`, set `"dry_run": false` in `config.json` first: `start` has no
-`--execute` flag.
+**Write the log path out absolutely.** `>> ../logs/loop.out` looks equivalent and
+is not: a redirection resolves `..` against the physical directory, and through the
+`current` symlink that is `releases/`, where there is no `logs` — so the shell
+refuses and the loop never starts. That was not a hypothetical: it happened during
+the 18:17 restart, and the only symptom was a missing pidfile. One `ps` after any
+start is the whole check:
+
+```bash
+ps -eo pid,args | awk '$2=="python3" && /mrmap_controller.cli loop/'
+```
+
+Starting is how `bin/mrmap-controller start` came to be, and it still reproduces
+this shape (it adds `--dry-run` when `config.json` says `dry_run: true`; there is
+no `--execute` flag — set `"dry_run": false` in the config to act). It is launched
+this way by hand because `start` writes the pidfile relative to its own directory,
+which is per-release: start and stop must run from the same `current`.
 
 **Single instance (W4):** `loop` refuses to start while another loop holds the
 flock on `<state_dir>/loop.lock`; the kernel drops that lock exactly when the
-holder dies. The pidfile check remains as the friendly message. A loop already
-running was started before the guard existed and is never touched by it.
+holder dies. The pidfile check remains as the friendly message. The flock is
+host-wide (the state directory is shared), so a second loop from another release
+is refused — which is the guard that matters now that releases coexist; the
+pidfile alone is per-release and would not have caught it.
 
 ### To turn it off
 
