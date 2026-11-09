@@ -1,5 +1,7 @@
 """Message construction for worker instructions."""
 
+from . import identity
+
 RULES = [
     'Rules for this task:',
     '- Push your fix to the SAME branch of this pull request. Do not open a new PR.',
@@ -61,12 +63,22 @@ def build_dispatch_message(cfg, *, issue, pr_number, pr_url, head_sha, ci_failur
     return text
 
 
-def build_spawn_prompt(cfg, issue, title):
+def build_spawn_prompt(cfg, issue, title, branch=None):
+    # The branch is passed in by the controller so that the name it asks AO to
+    # create and the name the worker is told cannot drift apart.
+    branch = branch or identity.branch_for(issue, title)
     return (
         f'Implement GitHub issue {cfg.repo}#{issue}: {title}\n\n'
         f'Start by reading the issue in full, then every applicable AGENTS.md '
         f'(repository root and the directories you touch). Follow the issue '
         f'acceptance criteria and the repository conventions.\n\n'
+        f'Your working branch is {branch} -- this issue\'s branch, named after '
+        f'its number and nothing else. The session is opened on it; if it is '
+        f'not there yet, create it from the current main. Keep this issue\'s '
+        f'work on that one branch and never move it to another: the number in '
+        f'the branch name is how the controller and the board tell which issue '
+        f'a branch and its pull request belong to, and a branch that names a '
+        f'different issue is read as that issue\'s work.\n\n'
         f'Claim the issue with scripts/wip claim before your first edit, and '
         f're-run it after every push.\n\n'
         f'Every Docker-heavy test must run through {cfg.docker_test_wrapper}; never '

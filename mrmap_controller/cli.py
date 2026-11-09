@@ -319,6 +319,12 @@ def cmd_doctor(args):
     except ao_mod.AOError as exc:
         check('ao daemon', False, exc)
     try:
+        check('ao opens a session on a named branch (W6)',
+              ao.spawn_branch_option_supported(),
+              'ao spawn --help lists --branch; without it issue identity breaks')
+    except Exception as exc:
+        check('ao opens a session on a named branch (W6)', False, exc)
+    try:
         enabled = [a for a in ao.automations() if a.get('enabled')]
         check('single scheduler (AO automations disabled)', not enabled,
               f'enabled: {[a.get("displayName") for a in enabled] or "none"}')

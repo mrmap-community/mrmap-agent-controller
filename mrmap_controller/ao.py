@@ -155,14 +155,37 @@ class AO:
         return (data or {}).get('automations') or []
 
     # ------------------------------------------------------------ acting ----
-    def spawn(self, issue, name, prompt):
+    def spawn(self, issue, name, prompt, branch=None):
+        """Open a worker session for one issue, on that issue's branch.
+
+        The branch is passed explicitly rather than left to AO's default:
+        the default is named after the session, so two sessions for the same
+        issue would work on two different branches, and the identity that
+        binds issue, session and branch would be lost.
+        """
         argv = ['ao', 'spawn', '--project', self.project, '--kind', 'worker',
                 '--issue', str(issue), '--name', name[:100], '--prompt', prompt]
+        if branch:
+            argv += ['--branch', branch]
         try:
             proc = self.runner.run(argv, timeout=max(self.timeout, 300))
         except Exception as exc:
             raise UncertainSpawn(f'spawn outcome unknown: {redact(exc)}') from exc
         return (proc.stdout or '').strip()
+
+    def spawn_branch_option_supported(self):
+        """Whether the installed ``ao`` accepts ``spawn --branch`` (W6).
+
+        Asked of the binary rather than read off a version string: the flag is
+        what the identity contract needs, and an AO that silently ignored it
+        would start every worker on a session-named branch again.
+        """
+        try:
+            proc = self.runner.run(['ao', 'spawn', '--help'], timeout=30)
+        except Exception as exc:
+            raise AOError(f'cannot ask ao spawn for its options: '
+                          f'{redact(exc)}') from exc
+        return '--branch' in ((proc.stdout or '') + (proc.stderr or ''))
 
     def resume_agent(self, session_id):
         """Restart an exited agent inside its existing session."""
