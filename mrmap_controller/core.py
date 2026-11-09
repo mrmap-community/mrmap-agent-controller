@@ -574,6 +574,78 @@ class Controller:
             self.log.error('follow_failure_bookkeeping_failed', issue=issue,
                            reason=redact(record_exc))
 
+    def _reconcile_closing(self, issue, pr_number):
+        """W2: a merged pull request whose issue is still open gets one ask.
+
+        GitHub's closing linkage (``pr_closes_issue``, the closed-references
+        connection) is the fact; the body's prose ``#N`` grep survives only as
+        the DB-labeling fallback in :meth:`pr_for`. When a PR merges while its
+        issue is still open -- the #981/#995 pattern: body said "What this
+        does (#981)", GitHub closed nothing, and intake could re-spawn the
+        already-delivered issue -- the controller posts exactly one comment
+        naming the merged PR and asks the human to close. Closing is the
+        human's act (cf. #1074, closed by jokiefer); the controller never
+        closes issues and never merges.
+
+        Dedupe rides on processed_events; a failed post stays unmarked and is
+        retried by ``mrmap-controller reconcile-closing`` -- a surface listing
+        every merged-PR-with-still-open-issue pair -- rather than re-firing
+        per tick, because the retired claim leaves the follow loop here.
+        """
+        key = f'{pr_number}:{issue}'
+        if db.seen(self.db, 'closing_reconcile', key):
+            return
+        try:
+            closes = self.gh.pr_closes_issue(pr_number, issue)
+        except GithubError as exc:
+            self.log.warning('closing_linkage_unreadable', issue=issue,
+                             pr=pr_number, reason=redact(exc))
+            return
+        if closes:
+            db.mark_events(self.db, [('closing_reconcile', key, issue, pr_number,
+                                      'closed-by-pr')], self.now())
+            self.log.info('closing_linkage_confirmed', issue=issue, pr=pr_number,
+                          detail='GitHub closed the issue when the PR merged')
+            return
+        try:                                  # maybe a human closed it already
+            state = (self.gh.issue(issue) or {}).get('state')
+        except GithubError as exc:
+            self.log.warning('closing_issue_state_unreadable', issue=issue,
+                             pr=pr_number, reason=redact(exc))
+            return
+        if state != 'open':
+            db.mark_events(self.db, [('closing_reconcile', key, issue,
+                                      pr_number, 'closed-by-human')], self.now())
+            self.log.info('closing_reconcile_not_needed', issue=issue,
+                          pr=pr_number, detail=f'issue already {state}')
+            return
+        body = (
+            '[mrmap-controller] The merged pull request '
+            f'#{pr_number} carries this issue\'s content, but GitHub\'s '
+            'closing linkage did not fire and the issue is still open. '
+            'If the delivered work covers this issue, please close it (or '
+            'close it as superseded and say what replaces it): while the '
+            'issue is open with its approval label, intake may hand it to '
+            'a new worker. The controller does not close issues itself.')
+        if not self.execute:
+            self.event('WOULD_RECONCILE_CLOSING', issue=issue, pr=pr_number,
+                       reason='merged PR did not close the issue; one ask would be '
+                              'posted for a human to close it')
+            return
+        try:
+            self.gh.post_issue_comment(issue, body)
+        except GithubError as exc:
+            self.event('RECONCILE_CLOSING_FAILED', issue=issue, pr=pr_number,
+                       reason=f'ask could not be posted: {redact(exc)}; run '
+                              f'"mrmap-controller reconcile-closing" for the '
+                              f'current human action list')
+            return
+        db.mark_events(self.db, [('closing_reconcile', key, issue, pr_number,
+                                  'asked-human')], self.now())
+        self.event('RECONCILE_CLOSING', issue=issue, pr=pr_number,
+                   reason='merged PR left the issue open; exactly one ask posted '
+                          'for the human to close it (the controller closes nothing)')
+
     def _follow_one(self, issue, capacity):
         # W4 backoff gate: a controller-side failure of this issue's follow is
         # retried no earlier than its bounded window says.
@@ -665,6 +737,7 @@ class Controller:
                        reason='merged by a human; claim '
                               + ('retired' if self.execute else 'would be retired')
                               + ', the controller merges nothing')
+            self._reconcile_closing(issue, pr_number)
             return
         if pr.get('state') == 'CLOSED':
             db.upsert_issue(self.db, issue, st.FAILED, self.now(),
@@ -1024,7 +1097,7 @@ _EVENT_LEVELS = {
     # Informational outcomes log at INFO; everything an operator should look at
     # logs at WARNING, and a controller-side failure logs at ERROR.
     'NEEDS_HUMAN': 40, 'ABORTED': 40, 'DISPATCH_FAILED': 40, 'INTAKE_BLOCKED': 40,
-    'PR_FOLLOW_FAILED': 40,
-    'WOULD_QUARANTINE': 30,
+    'PR_FOLLOW_FAILED': 40, 'RECONCILE_CLOSING_FAILED': 40,
+    'WOULD_QUARANTINE': 30, 'WOULD_RECONCILE_CLOSING': 30,
     'SPAWN_UNCERTAIN': 30, 'REJECT': 30, 'DEFER': 30,
 }

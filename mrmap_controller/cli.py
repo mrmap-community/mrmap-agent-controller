@@ -395,6 +395,53 @@ def cmd_release(args):
         lock.close()
 
 
+def cmd_reconcile_closing(args):
+    """W2: list merged-PR-with-still-open-issue pairs as a human action list.
+
+    The #981/#995 pattern in command form: the DB says merged, GitHub says the
+    issue is still open, and only a human closes it. This subcommand reads the
+    claims it retired as merged, asks GitHub whether each issue is still open,
+    and prints what a human should look at. It prints only: it mutates no
+    state, posts no comment and closes nothing.
+    """
+    cfg, log = build(args)
+    conn = open_db(cfg, log)
+    try:
+        gh = gh_mod.GitHub(controller_runner(cfg, log), cfg.repo)
+        pairs = []
+        for claim in db.all_claims(conn):
+            if claim['state'] != db.CLAIM_MERGED:
+                continue
+            row = db.get_issue(conn, claim['issue'])
+            pr_number = row['pr_number'] if row else None
+            if not pr_number:
+                pairs.append((claim['issue'], None, 'no PR recorded on the claim',
+                              None))
+                continue
+            try:
+                state = (gh.issue(claim['issue']) or {}).get('state')
+            except gh_mod.GithubError as exc:
+                pairs.append((claim['issue'], pr_number,
+                              f'issue state unreadable: {redact(exc)}', None))
+                continue
+            if state == 'open':
+                pairs.append((claim['issue'], pr_number,
+                              'still open after merge: close it if the PR '
+                              'delivered the work', state))
+        print(f'mrmap-controller reconcile-closing ({cfg.repo}, '
+              f'{getattr(cfg, "_source", "defaults")})')
+        print(f'Merged claims needing a human look ({len(pairs)} item(s)):')
+        for issue, pr_number, note, state in sorted(pairs):
+            print(f'  #{issue:<6} PR #{pr_number or "?":<6} {note}')
+        if not pairs:
+            print('  none')
+        print('Close issues yourself where the merged PR delivered the work; '
+              'this command never closes, comments or mutates anything.')
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_pause(args):
     RUN_DIR.mkdir(exist_ok=True)
     PAUSE_MARKER.write_text(args.reason or 'paused by operator\n')
@@ -578,6 +625,11 @@ def build_parser():
     release.add_argument('--who', default=os.environ.get('USER', 'unknown'),
                          help='name recorded in the audit note')
     release.set_defaults(func=cmd_release)
+
+    closing = sub.add_parser(
+        'reconcile-closing',
+        help='list merged PRs whose issue is still open (prints only, W2)')
+    closing.set_defaults(func=cmd_reconcile_closing)
 
     pause = sub.add_parser('pause', help='make every tick report-only')
     pause.add_argument('reason', nargs='?')
