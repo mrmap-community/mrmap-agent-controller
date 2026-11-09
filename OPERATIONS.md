@@ -1,21 +1,28 @@
 # MrMap Agent Controller — operations
 
-The controller is the autonomous layer on top of the pilot gatekeeper. It answers three
-questions on a timer:
+The controller is the autonomous layer on top of the pilot gatekeeper. It answers
+five questions on a timer:
 
 1. **Which issues may a worker take?** An issue must carry the human-applied
    `agent: approved` label and must not carry `agent: paused`. Nobody inside the
-   controller can approve; a `github.com/app` actor with that label is a bot marking its
-   own work and is rejected.
-2. **Is there room for a worker?** A slot is taken while the AO session is active; a session
-   that went idle still holds its issue until the pull request is merged.
-3. **What does an open pull request need?** CI failures and review feedback from a
-   *trusted* account are delivered into the session that owns the pull request, so CI
-   turns red for a few minutes and then goes green again on its own.
+   controller can approve; a `github.com/app` actor with that label is a bot
+   marking its own work and is rejected.
+2. **Is there room for a worker?** A slot is taken while the AO session is
+   *executing*; an idle or exited-but-alive session holds its issue but consumes
+   no slot.
+3. **What does an open pull request need?** CI failures and review feedback
+   from *trusted* accounts are delivered into the session that owns the pull
+   request.
+4. **Did a merged pull request actually close its issue?** GitHub's real closing
+   linkage is checked on merge; when it did not fire, one comment asks a human
+   to close (W2, see below). The controller closes nothing.
+5. **Has a human answered an open question?** Answered `scripts/wip ask`
+   questions and `scripts/decisions` decision requests wake their waiting
+   workers (W3, see below), gated by `questions_enabled`.
 
-It is a systemd timer (or `loop`) running `mrmap-controller tick` every five minutes.
-Every decision is in a state row and every state change is one JSON line in
-`logs/controller.jsonl`.
+Every decision is one row in the state database and one JSON line in
+`logs/controller.jsonl`. The tick's `runs` ledger row keeps the outcome and the
+action counts — that ledger is what proved the November incident, keep it.
 
 ---
 
@@ -24,17 +31,75 @@ Every decision is in a state row and every state change is one JSON line in
 | Path | What |
 | --- | --- |
 | `config.json` | the only file an operator edits (`0600`) |
-| `state/` / `state.sqlite3` | **the pilot's database**, shared with the gatekeeper; the controller only adds tables |
-| `backups/` | one consistent snapshot of that database per install/backup, `0600` |
-| `logs/controller.jsonl` | 5 MB × 5 rotated, secrets redacted |
-| `run/paused`, `run/controller.pid` | pause marker, loop pid |
-| `bin/mrmap-controller` | entry point |
+| `config.example.json` | every real key with its shipped default |
+| `state.sqlite3` (at `state_db`) | **the pilot's database**, shared with the gatekeeper; the controller only adds tables and columns, additively |
+| `<state_dir>/loop.lock` | flock taken by every `loop` — a second loop refuses to start (W4) |
+| `state/intake.lock` | the pilot's intake lock; shared, so a gatekeeper tick and a controller tick never overlap |
+| `backups/` | consistent `sqlite3 .backup` snapshots (`0600`) plus the W0 `state-before-W1.sqlite3` and the `pre-fixes-2026-11-09/` tar snapshot |
+| `logs/controller.jsonl` | structured events, rotated; the loop's own stdout/stderr go to `logs/loop.log` |
+| `paused` | pause marker (created by `pause`, removed by `resume`) |
+| `run/controller.pid` | pidfile of the detached loop (advisory; the flock enforces) |
+| `bin/mrmap-controller` | entry point: exports `MRMAP_CONTROLLER_CONFIG` and `PYTHONPATH`, execs `python3 -m mrmap_controller.cli` |
+| `systemd/` | unit files for hosts that have them — **inert on this host** (no systemd user bus) |
 
-`state.sqlite3` is the pilot's. The controller's schema is strictly additive: `claims` is
-read and written with the pilot's own column names, and `gatekeeper.py status` still works
-against a database the controller has touched. The two schedulers share the pilot's
-`state/intake.lock`, so a gatekeeper tick and a controller tick can never run at the same
-time. **Run at most one scheduler.**
+The schema is strictly additive and stamped with `PRAGMA user_version`
+(`ensure_schema` in `db.py`): columns this layout expects but the file lacks are
+added with `ALTER TABLE ... ADD COLUMN`, never dropped or recreated, so the
+legacy pilot keeps running against the same file. A database stamped *newer*
+than the code knows is refused rather than half-understood.
+
+---
+
+## Configuration
+
+Config is one JSON file (`$MRMAP_CONTROLLER_CONFIG`, default
+`<install>/config.json`). Unknown keys in the file are a hard error — the doc
+and the code cannot drift apart silently. Any key can also be overridden with
+the environment variable `MRMAP_CONTROLLER_<KEY_UPPER>`. These are **all** the
+keys that exist (from `mrmap_controller/config.py`):
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `repo` | `mrmap-community/mrmap` | owner/name |
+| `ao_project` | `mrmap` | which AO project to spawn into |
+| `state_db` | `/home/ota/.ao/mrmap-gatekeeper/state.sqlite3` | the pilot's file |
+| `lock_file` | `/home/ota/.ao/mrmap-gatekeeper/intake.lock` | the pilot's exclusive intake lock |
+| `log_dir` | `<install>/logs` | |
+| `backup_dir` | `<install>/backups` | target of `backup` |
+| `dry_run` | `true` | the install default; `tick --execute` overrides per run |
+| `max_workers` | `1` | executing AO sessions allowed; capped at 3 by validation |
+| `poll_interval_minutes` | `5` | loop interval |
+| `approved_label` | `agent: approved` | the only intake trigger |
+| `paused_label` | `agent: paused` | present on an issue → the controller is hands off |
+| `approvers` | `["jokiefer"]` | accounts whose `agent: approved` label event counts (the latest event must be a labeled event by one of them) |
+| `review_allowlist` | `["jokiefer"]` | who may direct a worker through PR feedback |
+| `review_associations` | `["OWNER","MEMBER","COLLABORATOR"]` | the author associations trusted on reviews **and on question answers** |
+| `ignore_authors` | `["mrmap-agent-bot"]` | never counted as answerers or feedback directors, whatever their association |
+| `max_ci_attempts_per_pr` | `2` | delivered CI fix requests per PR, then `NEEDS_HUMAN` |
+| `max_review_rounds_per_pr` | `4` | delivered review rounds per PR, then `NEEDS_HUMAN` |
+| `spawn_reconcile_grace_minutes` | `20` | a claim without a live session inside this window is `PENDING_SPAWN`, not quarantined |
+| `docker_test_wrapper` | `/home/ota/.ao/bin/mrmap-docker-test` | quoted into every worker prompt |
+| `capacity_script` | `/home/ota/agent-orchestrator-test/mrmap/scripts/agent_capacity` | host gate consulted before a spawn; may be empty |
+| `wip_script` | `/home/ota/agent-orchestrator-test/mrmap/scripts/wip` | run as `<wip_script> board` after claim-moving ticks (W5) |
+| `board_issue` | `917` | work board issue: target of the W4 stall alert and of W3's terminated-claimant surfacing |
+| `questions_enabled` | `report-only` | the W3 stage: `off` \| `report-only` \| `send` (see below) |
+| `count_foreign_workers` | `true` | sessions not spawned by the controller still consume worker slots |
+| `allow_restore_terminated` | `false` | AO does not restore a terminated session on Linux; stays false — a terminated claimant is surfaced, never resurrected |
+| `use_thread_resolution` | `true` | resolved/outdated review threads are skipped, not delivered |
+| `excluded_sessions` | `["mrmap-1"]` | never counted against `max_workers` (the orchestrator session) |
+| `message_max_chars` | `12000` | worker messages are truncated at this |
+| `quote_max_chars` | `700` | per review item quoted into a delivery |
+| `command_timeout_seconds` | `120` | timeout for `gh`, `ao` and `wip` subprocess calls |
+
+`approvers`, `review_allowlist`/`review_associations` and `ignore_authors` are
+the whole trust model. A review from anyone else is logged and left for a human;
+a question answer from anyone else never wakes a worker.
+
+**Phantom keys removed by the truth pass:** `poll_seconds`, `intake_labels`,
+`block_labels`, `min_seconds_between_dispatches`, `stale_after_hours`,
+`capacity_command`, `ao.project`, `github.exclude_labels` were documented here
+once and never existed in `config.py`. Anything not in the table above does not
+exist, and `config.load` refuses the file when it appears.
 
 ---
 
@@ -44,63 +109,23 @@ time. **Run at most one scheduler.**
 cd ~/.ao/mrmap-controller
 ./install.sh                     # safe: checks, backups, installs units, does NOT enable
 $EDITOR config.json
-mrmap-controller doctor          # 13 checks: gh, AO, config, state, capacity, Docker lock
-mrmap-controller tick            # one dry run, writes nothing that matters
-mrmap-controller status          # what it would do right now
-mrmap-controller logs --tail 40  # last events
+bin/mrmap-controller doctor      # every precondition: gh, AO, config, state, capacity, deny list
+bin/mrmap-controller tick        # one dry run; prints what it would do
+bin/mrmap-controller status      # what it currently believes, per issue
+bin/mrmap-controller logs -n 40  # last structured events
+bin/mrmap-controller reconcile-closing   # merged PRs whose issue is still open (W2)
 ```
 
-Decide from the dry run:
-
-```console
-$ mrmap-controller tick
-dry run · 1 action(s) · 6.5s
-  issue #120   → would spawn          … (1/1 slots used, trusted=…)
-```
-
-A dry run may say *would deliver* for CI or review events. It never spawns, never resumes,
-and never writes a claim. What it does write is one row in its own `runs` table, so the
-`runs` count in `status` grows with every report-only tick — the pilot's `claims` table is
-byte-identical after a dry run, which `tests/test_intake.py` asserts.
+A dry run reads everything and moves nothing: no spawn, no delivery, no claim
+write. It writes its own `runs` ledger row and its bookkeeping marks only — the
+pilot's `claims` table is byte-identical after a dry run, which
+`tests/test_intake.py` asserts.
 
 ---
 
 ## Activation
 
-The scheduler stays disabled until you enable it. Nothing above turns it on.
-
-### Host with systemd (the target deployment)
-
-```bash
-./install.sh --enable            # systemctl --user enable --now mrmap-controller.timer
-systemctl --user status mrmap-controller.timer
-journalctl --user -u mrmap-controller.service -f
-```
-
-Or by hand, in case you want to watch the first cycles:
-
-```bash
-systemctl --user start mrmap-controller.timer
-systemctl --user start mrmap-controller.service     # run one tick immediately
-```
-
-### This host (no systemd user bus)
-
-`install.sh --enable` refuses here and tells you to use the loop, which is the same
-behaviour without systemd: `setsid`, a pidfile, and the same `flock`, so two loops and a
-loop plus a timer can never overlap.
-
-```bash
-mrmap-controller start           # detached loop, 300s between ticks
-mrmap-controller start --execute # the real thing — only after a good dry run
-mrmap-controller loop --once     # foreground, exactly one tick (debugging)
-mrmap-controller stop            # TERM, then KILL after 40s; releases the lock
-```
-
-`start --execute` is the activation command on this host. Before running it, flip
-`"dry_run": false` in `config.json` if you want the loop to act without `--execute`.
-
-### Loop start (verified)
+### Loop start (verified — this is what actually runs here)
 
 The loop process actually running was inspected through `/proc` on 2026-11-09
 (pid `2489101`, recorded in `run/controller.pid`). Its real shape:
@@ -114,36 +139,46 @@ The loop process actually running was inspected through `/proc` on 2026-11-09
 | Start | `Fri Nov 6 15:37:01 2026`, detached (`setsid`, parent pid 1) |
 | systemd | not a unit — this host has no systemd user bus; `systemd/*.unit` files are inert |
 
-Behaviour-relevant environment (non-secret values, read from `/proc/2489101/environ`):
+Behaviour-relevant environment (non-secret values, read from
+`/proc/2489101/environ`):
 
 - `MRMAP_CONTROLLER_CONFIG=/home/ota/.ao/mrmap-controller/config.json`
-- `PYTHONPATH=/home/ota/.ao/mrmap-controller` (present twice: the wrapper appends it to an
-  already-set value)
-- Everything else is inherited from the operator's login shell (desktop/VNC variables);
-  secret-looking values are deliberately not recorded here.
+- `PYTHONPATH=/home/ota/.ao/mrmap-controller` (present twice: the wrapper appends
+  it to an already-set value)
+- Everything else is inherited from the operator's login shell; secret-looking
+  values are deliberately not recorded here.
 
-This is exactly what the entry point produces. The verified restart command — after
-`mrmap-controller stop` confirmed the old loop is gone — is:
+The verified restart sequence — after `bin/mrmap-controller stop` confirmed the
+old loop is gone — is:
 
 ```bash
 cd /home/ota/.ao/mrmap-controller
 setsid ./bin/mrmap-controller loop --write-pidfile >> logs/loop.log 2>&1 &
 ```
 
-`bin/mrmap-controller` exports `MRMAP_CONTROLLER_CONFIG` (defaulting to `config.json`) and
-`PYTHONPATH`, then execs `python3 -m mrmap_controller.cli`. The pidfile check in `loop` is
-advisory only; never run two schedulers.
+which is exactly what `bin/mrmap-controller start` reproduces (it adds
+`--dry-run` when `config.json` says `dry_run: true`). To activate without
+`--dry-run`, set `"dry_run": false` in `config.json` first: `start` has no
+`--execute` flag.
+
+**Single instance (W4):** `loop` refuses to start while another loop holds the
+flock on `<state_dir>/loop.lock`; the kernel drops that lock exactly when the
+holder dies. The pidfile check remains as the friendly message. A loop already
+running was started before the guard existed and is never touched by it.
 
 ### To turn it off
 
 ```bash
-mrmap-controller pause "reason"  # report-only, keeps ticking and logging
-systemctl --user stop mrmap-controller.timer   # or: mrmap-controller stop
+bin/mrmap-controller pause "reason"   # report-only, keeps ticking and logging
+bin/mrmap-controller resume
+bin/mrmap-controller stop             # SIGTERM to the pidfile pid; waits for the tick
 ```
 
-`pause` is the switch to reach for first: a paused controller reports what it would do,
-touches nothing, and — because that also blocks delivery — a paused controller will not
-interrupt a worker you are watching. `resume` returns to normal.
+`pause` is the switch to reach for first: a paused controller reports what it
+would do, touches nothing — a paused controller will not interrupt a worker you
+are watching — and the W3 stage likewise drops to report-only previews while
+paused, deciding nothing (dry-run and paused previews do **not** consume a
+question).
 
 ---
 
@@ -151,19 +186,91 @@ interrupt a worker you are watching. `resume` returns to normal.
 
 | | |
 | --- | --- |
-| May | read GitHub, `ao spawn` / `ao session wake` / `ao session resume --send`, write its own state, answer to your GitHub account only for those three `ao` calls |
-| Must not | merge, approve, comment, close, resolve, push, edit GitHub labels or permissions, kill a session, delete a volume, run any Docker command |
+| May | read GitHub; `ao spawn` / `ao send` / `ao session resume-agent`; post one comment via `gh issue comment` (the W4 stall alert, the W2 close ask, the W3 terminated-claimant surfacing); run `scripts/wip board`; write its own state database |
+| Must not | merge, approve, close, resolve, push, edit GitHub labels or permissions, kill or restore a session, delete a volume, run any Docker command |
 
-The prohibition is structural, not a prompt: every external call goes through a runner with
-a deny list, so `gh pr merge`, `gh api -X POST`, `ao pr merge`,
-`ao session kill` and `docker …` fail inside the controller before they reach a binary. A
-worker gets the same list as deny permissions on its `opencode` session and is instructed to
-run heavy tests only through `mrmap-docker-test`, which serialises Docker stacks.
+The prohibition is structural, not a prompt: every external call goes through a
+runner with a deny list, so `gh pr merge`, `gh api -X POST`, `ao session kill`
+and `docker …` fail inside the controller before they reach a binary. A worker
+gets the same list as deny permissions on its `opencode` session and is
+instructed to run heavy tests only through `mrmap-docker-test`.
 
-**Merging is the human's job.** When CI is green and no trusted finding is unanswered, the
-controller moves the issue to `ready_for_human_merge`, releases its claim, and says so. The
-worker's `scripts/wip done` has already released the board claim; the controller's row says
-how the work ended.
+**Merging and closing are the humans' jobs.** When CI is green and approved, the
+issue moves to `ready_for_human_merge` and *stays claimed* — the controller
+never releases a claim there and never merges. A claim is retired on `merged`
+only, or released by a human through `release --confirm`.
+
+---
+
+## Behaviours added by the loop-integrity and QA packages
+
+### W2 — closing-keyword reconciliation
+
+The spawn prompt now requires the PR body to carry `Closes #<N>` (own line, the
+actually assigned issue number) for default-branch PRs, and `Refs #<N>` plus a
+stacking disclosure — never `Closes` — for stacked or non-default-base PRs. A
+prose `( #N )` mention never closes an issue and is now only ever the DB-labeling
+fallback.
+
+On every merge observation the controller reads GitHub's **real closing
+linkage** (`closedIssues`, the closed-references connection behind the merge
+box's "closes #N" line). If the linkage did not fire and the issue is still
+open, it posts **exactly one** comment on the issue naming the merged PR and
+asking the human to close — the #981/#995 pattern made visible instead of
+silently re-dispatchable. The controller never closes issues itself.
+
+`bin/mrmap-controller reconcile-closing` prints the current human action list —
+every claim retired as `merged` whose GitHub issue is still open — and mutates
+nothing.
+
+### W3 — question & answer lifecycle (`questions_enabled`)
+
+One tick stage (`mrmap_controller/questions.py`) polls the comments of claimed
+and tracked issues **and of their parent epics**, recognizing both machine
+protocols verbatim: the `agent-question` marker of `scripts/wip ask` and the
+`decision-request` marker of `scripts/decisions`. The stable identifiers are the
+protocols' own ids (`id=0b014d9f`, `id=dr-85921e8f`); nothing is minted.
+
+An answer counts only when it comes from a human account (not a Bot type, not on
+`ignore_authors`) whose `author_association` is one of `review_associations`,
+and never from a machine-managed comment (claim, question, board, request,
+audit). Silence records nothing; partial answers never wake — a
+decision-request wakes its epic's claimed children **and the child issues a
+live worker session still carries** only when **all blocking
+asks** are answered, otherwise a `QUESTION_GAP` line names what is missing. A
+verified answer wakes the right worker through the normal AO layer (`ao send`,
+resuming an exited agent first) with `scripts/wip answers && scripts/wip claim`
+plus the verbatim answer and its permalink. A terminated claimant is never
+resurrected: it is logged and surfaced with one comment on `board_issue`.
+
+The rollout switch:
+
+- `report-only` (shipped default): every wake decision is computed and **logged
+  (`question_would_wake`) but nothing is sent**. Decisions are marked consumed
+  in this mode, so after a day of verified decisions, flipping to `send` applies
+  to answers that arrive from then on — old answers are not replayed; a worker
+  that missed one can always pull it with `scripts/wip answers`.
+- `send`: the decisions act (executing, unpaused ticks only).
+- `off`: the stage does not run.
+
+### W4 — watchdog, backoff, per-PR isolation
+
+- Three consecutive aborted ticks post **one** comment on `board_issue` and one
+  `CRITICAL loop_stalled` line; dedupe is per stall episode, a failed post
+  retries next tick. Nothing is ever restarted.
+- A controller-side failure while following one pull request is isolated to
+  that pull request (`PR_FOLLOW_FAILED`); the rest of the tick continues. The
+  retry window doubles from one tick interval, capped at 6 hours, and survives
+  restarts (it lives in the dispatches table). A permanently poisoned PR keeps
+  retrying at the cap until a human acts.
+
+### W5 — board refresh
+
+After any execute-mode tick that moved a claim (spawn, merge-retire,
+quarantine), the controller runs `scripts/wip board`; the board's format stays
+owned by `scripts/wip` and is duplicated nowhere. A failing `wip` run is a
+WARNING (`board_refresh_failed`) and never costs a tick. Dry-run ticks never
+touch the board.
 
 ---
 
@@ -171,28 +278,25 @@ how the work ended.
 
 ### Controller crashed / machine rebooted
 
-Nothing to decide: the timer starts the next tick and the first thing a tick does is
-reconcile. A row whose AO session vanished goes to `needs_reconciliation` and is never
-auto-resumed; a claim whose issue lost `agent: approved` and whose session is already gone
-is dropped; a claim whose session still exists becomes `running`.
+Nothing to decide: the loop is started again with the recorded command (or was
+never down) and the first thing a tick does is reconcile. A row whose AO session
+vanished goes to `needs_reconciliation` and is never auto-resumed; a claim whose
+session still exists is adopted.
 
 ### A claim is stuck and you are sure the session is gone
 
 ```bash
-mrmap-controller status --issue 120     # read what it sees and why
-mrmap-controller backup                 # snapshot first
-mrmap-controller release 120 --confirm  # deletes the claim row; intake may take the issue again
+bin/mrmap-controller status --json    # what it sees and why, per issue
+bin/mrmap-controller backup           # snapshot first
+bin/mrmap-controller release 120 --confirm
 ```
 
-`release` refuses without `--confirm`. It is the only command in the tool that lets a second
-worker be assigned to an issue. The row itself is kept, with state `released`, as the audit
-trail — the controller reads that as free, the pilot would still read any row as held. Only
-one of the two is ever running, so this cannot disagree with itself; if you ever hand the
-issue back to the pilot, delete the row.
+`release` refuses without `--confirm`. It is the only command that lets a second
+worker be assigned to an issue. The row stays with state `released` as the audit
+trail; the controller reads that as free, the pilot would read any row as held —
+if you ever hand the issue back to the pilot, delete the row.
 
-### You want to start over on an issue
-
-Apply the pause label rather than releasing, then remove it when you mean it:
+### You want to stop work on an issue for a while
 
 ```bash
 gh issue edit 120 --add-label "agent: paused"    # the controller stops touching it
@@ -202,92 +306,76 @@ gh issue edit 120 --remove-label "agent: paused" # it picks the issue up again n
 ### The state database itself
 
 ```bash
-mrmap-controller backup                       # → backups/state-<UTC>.sqlite3, 0600
-ls ~/.ao/mrmap-controller/backups
+bin/mrmap-controller backup     # → backups/state-<UTC>.sqlite3, 0600, online sqlite backup
 ```
 
-To restore, stop the scheduler, move the current file aside and copy a backup in place:
+Pre-parade snapshots from the November work packages are in `backups/` too:
+`state-before-W1.sqlite3` (the consistent snapshot taken before the W1 schema
+ALTER) and `pre-fixes-2026-11-09/` (the whole install tree; host has no rsync —
+tar). To restore, the loop must be down, then:
 
 ```bash
-systemctl --user stop mrmap-controller.timer   # or: mrmap-controller stop
-cp -a backups/state-20261106T150000Z.sqlite3 state.sqlite3
+bin/mrmap-controller stop; pgrep -f 'mrmap_controller.cli loop' || echo down
+cp backups/state-before-W1.sqlite3 /home/ota/.ao/mrmap-gatekeeper/state.sqlite3
+rm -f /home/ota/.ao/mrmap-gatekeeper/state.sqlite3-wal \
+      /home/ota/.ao/mrmap-gatekeeper/state.sqlite3-shm   # sidecars of the replaced file
+bin/mrmap-controller doctor
+bin/mrmap-controller start
 ```
 
-The controller never changes the database's format: it keeps the journal mode the pilot
-created (`delete`), writes only the pilot's five `claims` columns, and adds four tables of
-its own. Verified against a copy of the live database: the pilot's `init_db` runs on the
-migrated file, its `SELECT * FROM claims` reads rows the controller wrote, it can write back,
-and its `active_workers` — which counts AO sessions, not claims — ignores the controller's
-extra states (`merged`, `needs_reconciliation`, `released`) instead of tripping over them.
+The schema repair is additive-only and forward-compatible: old code runs
+against a migrated file (added columns carry defaults and the version stamp is
+ignored by it), so a code rollback needs no database rollback.
 
 ### A worker was started but never appeared
 
-`ao spawn` prints the new session on a line; if that read fails the controller records
-`start_uncertain` and will not start a second one. Run `mrmap-controller status`: if the
-issue reports `start_uncertain` and you can see no session, `release` it and let intake
-retry. If you *can* see the session, the next tick adopts it — intake looks up by issue id
-before it ever spawns.
+`ao spawn` prints the new session; if that read fails the controller records
+`SPAWN_UNCERTAIN` and will not start a second one. Run `status`: if you see no
+session, `release` the issue and let intake retry; if you *can* see the session,
+the next tick adopts it.
 
 ---
 
 ## Reading the log
 
 ```bash
-mrmap-controller logs --tail 40
-grep -e '"event": "SPAWN' -e '"event": "DELIVERY_FAILED"' logs/controller.jsonl
-python3 - <<'PY'
-import json
-for line in open('/home/ota/.ao/mrmap-controller/logs/controller.jsonl'):
-    r = json.loads(line)
-    if r.get('event') == 'TICK_SUMMARY':
-        print(r['ts'], r.get('report_only'), r.get('seconds'), r.get('actions'))
-PY
+bin/mrmap-controller logs -n 40
+bin/mrmap-controller logs --level WARNING
+grep -e '"event": "SPAWNED"' -e '"event": "DISPATCH_FAILED"' logs/controller.jsonl
 ```
 
-Events worth watching: `NO_APPROVED_LABEL` (intake idle, which is the normal state —
-approval is a human act), `capacity_full` / `deferred_capacity` (slots are full),
-`DELIVERY_FAILED` (the AO send was refused; the event stays retryable, up to the configured
-cap), `claim_needs_reconciliation`, `STALE` (a claim older than `stale_after_hours`).
+Events worth watching: `SPAWNED` / `SPAWN_UNCERTAIN`, `DEFER` (capacity or the
+host gate said no — a stream of these is not a dead loop, the counts ledger
+proves liveness), `NEEDS_HUMAN` (quarantine, closed PR, exhausted retries,
+terminated session), `MERGED` and `RECONCILE_CLOSING*` (W2), `DISPATCHED` /
+`DISPATCH_FAILED`, `QUESTION_ANSWERED` / `QUESTION_GAP` /
+`QUESTION_UNVERIFIED` / `question_would_wake` (W3), `loop_stalled` + a board
+comment (W4), `PR_FOLLOW_FAILED` (isolated poison PR), `ABORTED` with
+`tick_aborted`, `board_refresh_failed`.
 
 ---
 
-## Configuration
+## Host-side caveat (outside this install)
 
-| Key | Default | Notes |
-| --- | --- | --- |
-| `dry_run` | `true` | the install default; `tick` flips it off for one run |
-| `max_workers` | `1` | the rollout default. The feature caps at 3; above 3 is refused |
-| `poll_seconds` | `300` | used by the units and the loop |
-| `intake_labels` | `["agent: approved"]` | all must be present on the issue |
-| `block_labels` | `["agent: paused"]` | any present stops it; takes precedence over approval |
-| `approvers` | `["jokiefer"]` | the only account that may trigger a CI fix or a review response |
-| `max_ci_attempts_per_pr` / `max_review_rounds_per_pr` | `3` / `3` | per PR, counts **dispatches**, not deliveries: a delivery that never reached the session does not spend a round |
-| `min_seconds_between_dispatches` | `120` | grace so a new commit is not read as a fresh failure |
-| `stale_after_hours` | `48` | a claim older than this with no session is reported |
-| `capacity_command` | `…/scripts/agent_capacity` | may be empty, e.g. on a dedicated host |
-| `allow_restore_terminated` | `false` | AO does not restore a terminated session on Linux; this is why the limit holds |
-| `ao.project` | `mrmap-8` | which AO project to spawn into |
-| `github.exclude_labels` | `[epic, type: documentation]` | never assigned to a worker |
-
-`approvers` is the whole trust model for follow-up work. It starts with one account. A
-collaborator whose feedback you want acted on has to be added here **or** hold
-OWNER/MEMBER/COLLABORATOR on the repository; a review from anyone else is logged as
-`ignored_untrusted` and left for a human.
+Worker prompts on this host have carried stale "run `ao review trigger`" text.
+That text does **not** come from this controller (it exists nowhere in this
+install); it comes from the AO harness's prompt/skill templates, e.g.
+`~/.ao/data/prompts/<session>/system.md` and the worktree copy of
+`.opencode/skills/using-ao/commands/review.md`. Cleaning it is an
+orchestrator/host action outside this install; for this project AO native review
+is off and was never triggered.
 
 ---
 
 ## Limits this build does not remove
 
-- **No auto-merge and no auto-approval.** Not configurable, on purpose.
-- **Capacity is conservative.** A claim holds a slot until the PR is merged, so one
-  merged-but-unreconciled session can block intake for one tick. The reconciler clears it
-  on the next tick.
-- **A delivery that returns without an error is not proof.** AO reports
-  `connected: false` for the *previous* state when it wakes a session, so the controller
-  re-reads the session and only calls a delivery done when AO then reports it connected. If
-  that read is inconclusive, the event becomes `uncertain`: not retried (AO may well be
-  working on it), and visible in `status` as `delivery_uncertain`.
-- **`ao pr watch` stays off.** That feature tracks PRs through a per-PR daemon and has no
-  unwatch; the controller polls instead, which is restart-safe.
-- AO's own automation ("MrMap GitHub Issue Intake") must stay off while the controller is
-  on — `install.sh` refuses to enable both. The controller leaves it alone.
+- **No auto-merge, no auto-approval, no auto-close.** Not configurable, on
+  purpose.
+- **Capacity is conservative.** A claim holds its issue until merged; only
+  executing sessions consume a slot, waking one counts.
+- **A delivery that returns without an error is not proof.** AO reports the
+  *previous* state for a wake, so the controller re-reads the session; an
+  inconclusive read becomes `uncertain`: not retried, visible in `status`.
+- **`ao pr watch` stays off.** The controller polls, which is restart-safe.
+- AO's own automation ("MrMap GitHub Issue Intake") must stay off while the
+  controller is on; `doctor` checks that exactly one scheduler is live.
