@@ -327,6 +327,13 @@ def cmd_doctor(args):
         check('github authentication (gh)', True, f'logged in as {gh.whoami()}')
     except gh_mod.GithubError as exc:
         check('github authentication (gh)', False, exc)
+    try:
+        check('closing linkage is readable (W2)',
+              gh.closing_linkage_field_supported(),
+              f'{gh_mod.PR_CLOSING_FIELD} exists on PullRequest; without it a merged '
+              'PR can never be checked against its issue')
+    except Exception as exc:
+        check('closing linkage is readable (W2)', False, exc)
     ao = ao_mod.AO(runner, cfg.ao_project)
     try:
         sessions = ao.sessions()
