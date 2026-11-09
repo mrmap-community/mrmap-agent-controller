@@ -17,6 +17,7 @@ answer to the waiting worker that asked (W3).
 import json
 import re
 
+from . import identity
 from .logging_util import redact
 
 PR_FIELDS = ('number,state,isDraft,headRefName,headRefOid,mergedAt,closedAt,url,'
@@ -224,12 +225,24 @@ class GitHub:
     # ------------------------------------------------------------ helpers ---
     @staticmethod
     def pr_references_issue(pr, issue):
-        """Conservative reference test, shared with the pilot's rule."""
+        """Reference test: an explicit number in title/body, or the branch.
+
+        The branch counts only when it *declares* this issue under the shared
+        segment rule (:mod:`mrmap_controller.identity`). The old test matched
+        ``issue[-_]/<digits>`` anywhere inside the branch string, which is how
+        ``ao/implement-github-issue-5/root`` was read as a pull request for
+        issue #5.
+        """
         n = str(issue)
         text = (pr.get('title') or '') + '\n' + (pr.get('body') or '')
+        if re.search(r'(?<!\d)#' + n + r'(?!\d)', text):
+            return True
         branch = ((pr.get('head') or {}).get('ref') or pr.get('headRefName') or '')
-        return (bool(re.search(r'(?<!\d)#' + n + r'(?!\d)', text))
-                or bool(re.search(r'(?<!\d)(?:issue[-_/]|/)' + n + r'(?!\d)', branch, re.I)))
+        try:
+            number = int(n)
+        except ValueError:
+            return False
+        return identity.issue_from_branch(branch) == number
 
 
 # ------------------------------------------------------------- CI facts -----

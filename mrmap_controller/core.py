@@ -18,7 +18,7 @@ import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from . import db, lifecycle as st
+from . import db, identity, lifecycle as st
 from . import questions as questions_mod
 from .ao import AOError, UncertainSpawn
 from .github import GithubError, interpret_ci
@@ -284,6 +284,8 @@ class Controller:
                 continue
             if live:
                 sess = live[0]
+                if not self.identity_ok(issue, sess):
+                    continue
                 # A live session carrying the issueId outranks any quarantined
                 # row: this tick adopts, so the projection must not be clamped
                 # to failed by the stale claim the dry run did not rewrite.
@@ -372,6 +374,8 @@ class Controller:
             live = [s for s in self.by_issue.get(number, []) if not s.is_terminated]
             if live:
                 sess = live[0]
+                if not self.identity_ok(number, sess):
+                    continue
                 if not claim and self.execute:
                     db.claim_issue(self.db, number, db.CLAIM_SPAWNED, self.now(),
                                    'adopted existing AO session', session_id=sess.id)
@@ -413,6 +417,31 @@ class Controller:
                 self.event('WOULD_SPAWN', issue=number, reason=reason)
                 continue
             self._spawn(issue, number, reason, capacity)
+
+    def identity_ok(self, issue, sess):
+        """Whether this session may stand for this issue (W6).
+
+        The session's ``issueId`` is the assignment; its branch can confirm that
+        assignment but must never contradict it. A branch that declares a
+        *different* issue means two tools hold two stories about one work item,
+        which is what once wrote claims and a board row onto issues closed in
+        2021. Neither reading is acted on: the work item is stopped and handed
+        to a human.
+        """
+        ok, reason = identity.verify_assignment(issue, sess.branch)
+        if ok:
+            return True
+        claim = db.get_claim(self.db, issue)
+        if claim and claim['state'] in (db.CLAIM_MERGED, db.CLAIM_RELEASED):
+            # Nothing is in flight: report the contradiction, but a finished
+            # fact is not rewritten into a failure.
+            self.event('NEEDS_HUMAN', issue=issue, session=sess.id, reason=reason)
+            return False
+        self.claim_truth[issue] = db.CLAIM_RECONCILE
+        self._set_claim(issue, db.CLAIM_RECONCILE, reason, session_id=sess.id)
+        self.project(issue, st.FAILED, self.now(), session_id=sess.id, reason=reason)
+        self.event('NEEDS_HUMAN', issue=issue, session=sess.id, reason=reason)
+        return False
 
     def verify_approval(self, number):
         """Latest ``agent: approved`` label event must be a human allowlist add."""
@@ -471,10 +500,16 @@ class Controller:
             self.event('NEEDS_HUMAN', issue=number,
                        reason=f'cannot re-check labels before spawn: {redact(exc)}')
             return
-        prompt = build_spawn_prompt(self.cfg, number, issue.get('title') or '')
+        # One branch name, derived from the assignment, is given to AO *and* to
+        # the prompt: AO's own default is named after the session, so two
+        # sessions for one issue would produce two branches, and a branch the
+        # worker invents from the prompt text is what broke issue identity.
+        branch = identity.branch_for(number, issue.get('title') or '')
+        prompt = build_spawn_prompt(self.cfg, number, issue.get('title') or '',
+                                    branch=branch)
         name = f'Issue #{number}: {title}'
         try:
-            output = self.ao.spawn(number, name, prompt)
+            output = self.ao.spawn(number, name, prompt, branch=branch)
         except AOError as exc:      # includes UncertainSpawn
             # The claim is kept: a timeout can mean the spawn did happen.
             db.set_claim(self.db, number, db.CLAIM_SPAWNING, self.now(),

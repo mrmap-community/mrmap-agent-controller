@@ -205,19 +205,23 @@ class FakeAO(Recording):
         return [s for s in self.sessions_list
                 if s.issue == int(issue) and not s.is_terminated]
 
-    def spawn(self, issue, name, prompt):
+    def spawn(self, issue, name, prompt, branch=None):
         # A spawn that cannot be confirmed is never a clean failure: the real
         # adapter raises UncertainSpawn for both timeouts and transport errors.
         # The call is recorded first because the command really was started.
-        self.note('spawn', issue=issue, name=name, prompt=prompt)
+        self.note('spawn', issue=issue, name=name, prompt=prompt, branch=branch)
         self._maybe_fail('spawn', UncertainSpawn)
         if self.spawn_creates:
             created = []
             for _ in range(self.spawn_creates_count):
-                sess = Session({'id': f'{self.project}-{self.next_session_number}',
+                session_id = f'{self.project}-{self.next_session_number}'
+                sess = Session({'id': session_id,
                                 'projectId': self.project, 'kind': 'worker',
                                 'issueId': str(issue), 'activity': {'state': 'active'},
-                                'isTerminated': False, 'prs': []})
+                                'isTerminated': False, 'prs': [],
+                                # AO opens the worktree on the branch it is asked
+                                # for, and names one itself when nothing is asked.
+                                'branch': branch or f'ao/{session_id}/root'})
                 self.next_session_number += 1
                 self.sessions_list.append(sess)
                 created.append(sess.id)
@@ -398,11 +402,13 @@ def label_event(event, actor, event_id=1, when='2026-11-06T10:00:00Z', label='ag
 
 
 def session(session_id, issue=None, activity='active', terminated=False, prs=None,
-            role='worker'):
+            role='worker', branch=None):
     return {'id': session_id, 'projectId': 'mrmap', 'kind': role,
             'issueId': str(issue) if issue is not None else None,
             'activity': {'state': activity}, 'isTerminated': terminated,
-            'prs': prs or []}
+            # A real session always reports a branch; a test that does not care
+            # leaves it empty, which declares no issue and so stays compatible.
+            'branch': branch or '', 'prs': prs or []}
 
 
 def pr(number=500, issue=120, state='OPEN', sha='a' * 40, checks=None,

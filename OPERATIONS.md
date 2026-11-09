@@ -287,6 +287,29 @@ owned by `scripts/wip` and is duplicated nowhere. A failing `wip` run is a
 WARNING (`board_refresh_failed`) and never costs a tick. Dry-run ticks never
 touch the board.
 
+### W6 — issue identity (`mrmap_controller/identity.py`)
+
+One issue number is carried through the whole work item. For every start the
+controller derives `ao/issue-<N>-<slug>` from the issue it was assigned, passes
+it to `ao spawn --branch` **and** puts the same name in the spawn prompt, so the
+workspace, the instruction and the claim cannot tell three stories.
+
+A branch is only ever read back as a statement about an issue when a path
+segment *starts* with `issue-<N>` (or `#<N>`) — the same rule `scripts/wip`
+uses, deliberately byte-for-byte. A number buried in a prose slug declares
+nothing: `ao/implement-github-issue-5/root` is what AO generated from the prompt
+"Implement GitHub issue …#682", and reading issue #5 out of it is how claims and
+a board row landed on issues closed in 2021. Names from before this change
+(`ao/mrmap-77/root`, and the incident names above) declare nothing and keep
+working; nothing is retro-renamed.
+
+When a live session's branch declares a *different* issue than its assignment,
+the controller refuses to pick a winner: the claim goes to
+`needs_reconciliation`, the issue projects `failed`, and the action is
+`NEEDS_HUMAN` with both numbers in the reason. A human decides which reading is
+right — usually by fixing the branch, or by `release <issue> --confirm` to let
+the issue be worked again.
+
 ---
 
 ## Recovery
