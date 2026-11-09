@@ -1,5 +1,7 @@
 """Adapters, CI interpretation, config and logging -- driven by a fake runner."""
 import json
+import pathlib
+import tempfile
 import unittest
 
 from mrmap_controller import ao as ao_mod, config as config_mod, github as gh_mod
@@ -237,6 +239,37 @@ class AOAdapter(unittest.TestCase):
 
 
 class ConfigBehaviour(unittest.TestCase):
+    """Loading a configuration, on a machine that is not the deployment host.
+
+    ``_validate`` requires the state database's directory to exist, and the default
+    ``state_db`` names the deployment host's directory. That is correct for a
+    controller about to run and wrong for a test about override precedence, so
+    these tests load with a state database in a temporary directory: the four
+    errors this used to cause on CI were the validator refusing a machine, not the
+    code under test being wrong. The rule itself keeps its own case below, and on
+    the deployment host ``doctor`` checks it against the real path.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state_db = str(pathlib.Path(self.tmp) / 'state.sqlite3')
+
+    def load_ok(self, path=None, **overrides):
+        """``load`` with overrides, spelled without their env prefix."""
+        env = {f'MRMAP_CONTROLLER_{key.upper()}': str(value)
+               for key, value in overrides.items()}
+        env.setdefault('MRMAP_CONTROLLER_STATE_DB', self.state_db)
+        return config_mod.load(path, env=env)
+
+    def test_a_missing_state_db_directory_is_refused(self):
+        # The rule the rest of this class works around needs its own test, or
+        # removing it would go unnoticed: a controller that starts and then dies
+        # at its first write is exactly what this check prevents.
+        values = dict(config_mod.DEFAULTS)
+        values['state_db'] = str(pathlib.Path(self.tmp) / 'no-such-directory' / 'state.sqlite3')
+        with self.assertRaises(config_mod.ConfigError) as caught:
+            config_mod._validate(config_mod.Config(values))
+        self.assertIn('state_db parent directory missing', str(caught.exception))
     def test_unknown_key_is_refused(self):
         import pathlib
         import tempfile
@@ -246,17 +279,14 @@ class ConfigBehaviour(unittest.TestCase):
             config_mod.load(path)
 
     def test_environment_override(self):
-        import pathlib
-        import tempfile
-        path = pathlib.Path(tempfile.mkdtemp()) / 'config.json'
+        path = pathlib.Path(self.tmp) / 'config.json'
         path.write_text('{"max_workers": 1}')
-        cfg = config_mod.load(path, env={'MRMAP_CONTROLLER_MAX_WORKERS': '3'})
+        cfg = self.load_ok(str(path), max_workers=3)
         self.assertEqual(cfg.max_workers, 3)
 
     def test_boolean_override_and_list_override(self):
-        cfg = config_mod.load('/nonexistent/config.json', env={
-            'MRMAP_CONTROLLER_DRY_RUN': 'false',
-            'MRMAP_CONTROLLER_APPROVERS': 'alice, bob'})
+        cfg = self.load_ok('/nonexistent/config.json', dry_run='false',
+                           approvers='alice, bob')
         self.assertFalse(cfg.dry_run)
         self.assertEqual(cfg.approvers, ['alice', 'bob'])
 
@@ -272,11 +302,17 @@ class ConfigBehaviour(unittest.TestCase):
             config_mod._validate(config_mod.Config(values))
 
     def test_shipped_config_matches_the_documented_defaults(self):
-        cfg = config_mod.load(str(config_mod.BASE / 'config.json'), env={})
+        cfg = self.load_ok(str(pathlib.Path(config_mod.BASE) / 'config.json'))
         self.assertTrue(cfg.dry_run, 'the shipped default must be a dry run')
         self.assertLessEqual(cfg.max_workers, 3)
         self.assertEqual(cfg.approvers, ['jokiefer'])
         self.assertEqual(cfg.poll_interval_minutes, 5)
+        # state_db is the one default these tests cannot use, so it is pinned
+        # against the file a fresh install copies instead: the code's default and
+        # the documented example have to stay one statement.
+        example = json.loads((pathlib.Path(config_mod.BASE)
+                              / 'config.example.json').read_text())
+        self.assertEqual(config_mod.DEFAULTS['state_db'], example['state_db'])
 
 
 class Redaction(unittest.TestCase):
