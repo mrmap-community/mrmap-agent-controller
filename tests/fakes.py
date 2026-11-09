@@ -46,7 +46,8 @@ class FakeGitHub(Recording):
         'mrmap_controller.github', fromlist=['GitHub']).GitHub.pr_references_issue)
 
     def __init__(self, issues=None, events=None, pulls=None, prs=None, reviews=None,
-                 review_comments=None, issue_comments=None, threads=None, login='mrmap-agent-bot'):
+                 review_comments=None, issue_comments=None, threads=None, login='mrmap-agent-bot',
+                 closed_links=None, parents=None):
         super().__init__()
         self.issues = issues or []
         self.events = events or {}
@@ -54,8 +55,15 @@ class FakeGitHub(Recording):
         self.prs = prs or {}
         self.reviews = reviews or {}
         self.review_comments = review_comments or {}
-        self.issue_comments = issue_comments or {}
+        # GitHub serves PR conversation comments and plain issue comments from
+        # one endpoint in one shared numbering space, so one map covers both.
+        self.comments_by_number = issue_comments or {}
         self.threads = threads or {}
+        # pr number -> issue numbers GitHub's closing linkage says that PR closed
+        # (W2): the closed_references payload of the fakes.
+        self.closed_links = closed_links or {}
+        # issue number -> native sub-issue parent number (W3 epics)
+        self.parents = parents or {}
         self.login = login
         self.fail_on = set()
         # number -> exception: pr_view raises exactly this for that one pull
@@ -122,7 +130,24 @@ class FakeGitHub(Recording):
     def pr_issue_comments(self, number):
         self._maybe_fail('pr_issue_comments')
         self.note('pr_issue_comments', number=number)
-        return list(self.issue_comments.get(number, []))
+        return list(self.comments_by_number.get(number, []))
+
+    def issue_comments(self, number):
+        # Same REST endpoint as pr_issue_comments -- issues and PRs share the
+        # numbering space; W3 reads the author_association of each comment.
+        self._maybe_fail('issue_comments')
+        self.note('issue_comments', number=number)
+        return list(self.comments_by_number.get(number, []))
+
+    def issue_parent(self, number):
+        self._maybe_fail('issue_parent')
+        self.note('issue_parent', number=number)
+        return self.parents.get(number)
+
+    def pr_closes_issue(self, pr_number, issue):
+        self._maybe_fail('pr_closes_issue')
+        self.note('pr_closes_issue', pr=pr_number, issue=issue)
+        return int(issue) in {int(n) for n in self.closed_links.get(pr_number, set())}
 
     def pr_resolved_thread_comment_ids(self, number):
         self._maybe_fail('pr_resolved_thread_comment_ids')

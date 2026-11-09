@@ -48,6 +48,10 @@ DEFAULTS = {
     # work board refresh (W5) and stall alerting (W4)
     'wip_script': '/home/ota/agent-orchestrator-test/mrmap/scripts/wip',
     'board_issue': 917,
+    # question/answer lifecycle (W3): 'off' skips the stage, 'report-only'
+    # logs each wake decision without sending anything (the shipped default),
+    # 'send' wakes the waiting worker for a verified human answer.
+    'questions_enabled': 'report-only',
     # behaviour switches
     'count_foreign_workers': True,
     'allow_restore_terminated': False,
@@ -154,5 +158,8 @@ def _validate(cfg):
         raise ConfigError('repo must be owner/name')
     if not cfg.approvers:
         raise ConfigError('approvers must not be empty: approvals need a human allowlist')
+    if cfg.questions_enabled not in ('off', 'report-only', 'send'):
+        raise ConfigError('questions_enabled must be "off", "report-only" or '
+                          f'"send", got {cfg.questions_enabled!r}')
     if not Path(cfg.state_db).parent.is_dir():
         raise ConfigError(f'state_db parent directory missing: {cfg.state_db}')
