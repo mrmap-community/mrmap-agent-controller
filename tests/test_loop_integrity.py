@@ -6,7 +6,9 @@ refresher is recorded by the harness, so no test runs ``scripts/wip``, touches
 the network or posts anything anywhere.
 """
 import datetime as dt
+import pathlib
 import sqlite3
+import tempfile
 import unittest
 from unittest import mock
 
@@ -83,6 +85,60 @@ class ClaimsIssuesConvergence(unittest.TestCase):
         self.assertNotIn('MERGED', report['counts'])
         self.assertIsNotNone(db.get_claim(h.conn, 120),
                              'retired means skipped, not deleted: the audit row stays')
+
+    # -- the residual the W1 tail left open: a quarantined claim whose issue
+    #    still has an open pull request -------------------------------
+    def _quarantine_with_pr(self, **pr_kwargs):
+        """The live #1009 shape: claim quarantined, PR #1114 open and CI green."""
+        h = Harness(execute=True)
+        self.addCleanup(h.close)
+        h.claim(1009, state='needs_reconciliation', session_id='mrmap-13')
+        db.upsert_issue(h.conn, 1009, 'failed', fakes.now(),
+                        session_id='mrmap-13', pr_number=1114)
+        gh = fakes.FakeGitHub(
+            issues=[approved_issue(1009)],
+            events={1009: [label_event('labeled', 'jokiefer')]},
+            pulls=[open_pr_entry(1114, 1009)],
+            prs={1114: pr(1114, 1009, **pr_kwargs)},
+            reviews={1114: []})
+        ao = fakes.FakeAO([session('mrmap-13', issue=1009, terminated=True,
+                                   prs=[{'number': 1114}])])
+        return h, gh, ao
+
+    def test_quarantined_claim_with_open_pr_never_proceeds(self):
+        # The residual of D-risk 2: the W1 guard covered the pr_number is None
+        # tail only, so the pull-request path kept writing live-looking states.
+        h, gh, ao = self._quarantine_with_pr()
+        report = h.tick(gh=gh, ao=ao)
+        row = h.rows()[1009]
+        self.assertEqual(row['state'], 'failed',
+                         f'projection said {row["state"]!r} for a quarantined claim')
+        self.assertEqual(row['pr_number'], 1114,
+                         'the pull request stays recorded: reconciliation needs it')
+        self.assertIn('IDLE', report['counts'],
+                      'the pull request is still read and its events still retired')
+        self.assertEqual(db.get_claim(h.conn, 1009)['state'], db.CLAIM_RECONCILE)
+
+    def test_quarantined_claim_with_running_checks_never_proceeds(self):
+        h, gh, ao = self._quarantine_with_pr(checks=fakes.pending_checks())
+        h.tick(gh=gh, ao=ao)
+        self.assertEqual(h.rows()[1009]['state'], 'failed')
+
+    def test_quarantined_claim_still_reports_a_ready_pull_request(self):
+        # Clamping is about hiding progress, never about hiding a human action:
+        # "CI green and approved, a human merges" must stay visible.
+        h, gh, ao = self._quarantine_with_pr(review_decision='APPROVED')
+        report = h.tick(gh=gh, ao=ao)
+        self.assertIn('READY', report['counts'])
+        self.assertEqual(h.rows()[1009]['state'], 'ready_for_human_merge')
+
+    def test_quarantined_claim_is_retired_when_the_pr_merges(self):
+        h, gh, ao = self._quarantine_with_pr(state='MERGED')
+        report = h.tick(gh=gh, ao=ao)
+        self.assertIn('MERGED', report['counts'])
+        self.assertEqual(h.rows()[1009]['state'], 'merged')
+        self.assertEqual(db.get_claim(h.conn, 1009)['state'], db.CLAIM_MERGED,
+                         'a merged pull request settles the quarantine for real')
 
 
 class PerPrIsolation(unittest.TestCase):
@@ -329,25 +385,64 @@ class BoardRefresh(unittest.TestCase):
 class RefreshBoardHelper(unittest.TestCase):
     """W5 unit: lifecycle.refresh_board runs wip and survives every failure."""
 
-    def cfg(self, script='/mock/wip'):
+    def setUp(self):
+        # scripts/wip resolves its repository from the current directory, so a
+        # realistic fixture is a real directory layout: <repo>/scripts/wip.
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix='mrmap-wip-board-test-'))
+        self.repo = self.tmp / 'mrmap'
+        (self.repo / 'scripts').mkdir(parents=True)
+        self.script = self.repo / 'scripts' / 'wip'
+        self.script.write_text('#!/bin/sh\nexit 0\n')
+        self.script.chmod(0o755)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def cfg(self, script=None):
         values = dict(config_mod.DEFAULTS)
-        values['wip_script'] = script
+        values['wip_script'] = str(self.script) if script is None else script
         return config_mod.Config(values)
+
+    def test_board_repository_is_the_checkout_that_carries_the_script(self):
+        self.assertEqual(st.board_repository(str(self.script)), str(self.repo))
+        self.assertIsNone(st.board_repository(''), 'unset means no repository')
 
     def test_invokes_wip_board_with_the_command_timeout(self):
         log = fakes._Capturing()
         done = type('P', (), {'returncode': 0, 'stdout': 'board ok', 'stderr': ''})
         with mock.patch.object(st.subprocess, 'run', return_value=done) as run:
             self.assertTrue(st.refresh_board(self.cfg(), log))
-        run.assert_called_once_with(['/mock/wip', 'board'], capture_output=True,
-                                    text=True, timeout=120)
+        run.assert_called_once_with([str(self.script), 'board'],
+                                    capture_output=True, text=True, timeout=120,
+                                    cwd=str(self.repo))
         self.assertTrue(log.events('board_refreshed'))
+
+    def test_board_runs_inside_the_repository_not_the_controller_install(self):
+        # scripts/wip resolves the repository with `gh repo view` and
+        # `git rev-parse`, both of which read the working directory. Run from
+        # the controller's install directory it cannot see the application
+        # repository and `wip board` fails, which silently disables W5.
+        log = fakes._Capturing()
+        done = type('P', (), {'returncode': 0, 'stdout': '', 'stderr': ''})
+        with mock.patch.object(st.subprocess, 'run', return_value=done) as run:
+            st.refresh_board(self.cfg(), log)
+        self.assertEqual(pathlib.Path(run.call_args.kwargs['cwd']),
+                         self.repo.resolve(),
+                         'the board tool must run in its own checkout')
 
     def test_wip_failure_is_a_warning_not_a_tick_problem(self):
         log = fakes._Capturing()
         bad = type('P', (), {'returncode': 1, 'stdout': '', 'stderr': 'gh: boom'})
         with mock.patch.object(st.subprocess, 'run', return_value=bad):
             self.assertFalse(st.refresh_board(self.cfg(), log))
+        self.assertTrue(log.events('board_refresh_failed'))
+
+    def test_missing_script_is_a_warning_without_a_subprocess(self):
+        log = fakes._Capturing()
+        with mock.patch.object(st.subprocess, 'run') as run:
+            self.assertFalse(st.refresh_board(self.cfg(str(self.tmp / 'gone')), log))
+        run.assert_not_called()
         self.assertTrue(log.events('board_refresh_failed'))
 
     def test_missing_or_broken_script_is_a_warning(self):
