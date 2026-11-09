@@ -245,17 +245,70 @@ class DecisionRequestLifecycle(unittest.TestCase):
                             for e in self.h.log.records))
         self.assertEqual(summary['mode'], 'send')
 
-    def test_report_only_records_then_send_does_not_replay(self):
-        # first pass in report-only: the decision is logged and consumed
+    def test_report_only_observes_without_burning_the_answer(self):
+        """The rollout must be finishable.
+
+        The shipped default is ``report-only``: an operator lets it run for a
+        day to see what the stage would do, then flips it to ``send``. If the
+        report also consumed the decision, every question that arrived during
+        that day would be lost to the worker forever -- an unobservable,
+        one-way door. So a report records the decision as *observed* and a
+        later ``send`` tick still delivers it, exactly once.
+        """
         self.h.cfg._v['questions_enabled'] = 'report-only'
         self.h.run_questions()
-        self.assertEqual(self.h.ao.sends, [])
+        self.assertEqual(self.h.ao.sends, [], 'report-only sends nothing')
         self.assertTrue(self.h.log.events('question_would_wake'))
-        self.assertTrue(db.seen(self.h.conn, 'decision_request', DR))
-        # flipping the switch later must not replay the old answer
+        self.assertFalse(db.seen(self.h.conn, 'decision_request', DR),
+                         'a report must not claim the delivery kind')
+        self.assertTrue(db.seen(self.h.conn, 'decision_request_observed', DR))
+        # a second report-only pass neither repeats the report nor sends
+        before = len(self.h.log.events('question_would_wake'))
+        self.h.run_questions()
+        self.assertEqual(len(self.h.log.events('question_would_wake')), before,
+                         'an observed decision is not reported again every tick')
+        self.assertEqual(self.h.ao.sends, [])
+        # flipping the switch: the same answer is now delivered, once
         self.h.cfg._v['questions_enabled'] = 'send'
         self.h.run_questions()
-        self.assertEqual(self.h.ao.sends, [])
+        self.assertEqual([s for s, _ in self.h.ao.sends], [WORKER])
+        self.assertTrue(db.seen(self.h.conn, 'decision_request', DR))
+        self.h.run_questions()
+        self.assertEqual(len(self.h.ao.sends), 1, 'the delivery is not repeated')
+
+    def test_report_only_surfaces_a_dead_worker_without_burning_the_answer(self):
+        # the terminated-claimant path in report-only must stay recoverable too
+        self.h = QuestionHarness(
+            decision_comments(answers=[(ANSWER_TEXT, 'jokiefer', 'MEMBER')]),
+            workers=[session(WORKER, issue=CHILD, terminated=True)],
+            questions_enabled='report-only')
+        self.h.run_questions()
+        self.assertEqual(self.h.gh.posted_comments, [],
+                         'report-only posts nothing, not even the board ask')
+        self.assertFalse(db.seen(self.h.conn, 'decision_child_wake',
+                                 f'{DR}:{CHILD}'))
+        self.h.cfg._v['questions_enabled'] = 'send'
+        self.h.run_questions()
+        self.assertEqual(len(self.h.gh.posted_comments), 1,
+                         'the surfacing the report-only pass skipped still happens')
+
+    def test_delivered_decision_is_never_replayed_by_a_report_only_pass(self):
+        # order reversed: send first, then fall back to report-only
+        self.h.run_questions()                     # send, executes
+        self.assertEqual(len(self.h.ao.sends), 1)
+        self.h.cfg._v['questions_enabled'] = 'report-only'
+        self.h.run_questions()
+        self.assertEqual(len(self.h.ao.sends), 1, 'a delivered wake is closed')
+        self.assertEqual(self.h.log.events('question_would_wake'), [])
+
+    def test_mark_kind_is_the_whole_observed_rule(self):
+        self.assertEqual(questions.mark_kind('report-only',
+                                             questions.KIND_AGENT_QUESTION),
+                         questions.KIND_AGENT_QUESTION_OBSERVED)
+        for mode in ('send', 'off'):
+            self.assertEqual(questions.mark_kind(mode,
+                                                 questions.KIND_AGENT_QUESTION),
+                             questions.KIND_AGENT_QUESTION)
 
     def test_dry_run_previews_without_consuming(self):
         # send mode, but the tick does not execute: a preview line only,

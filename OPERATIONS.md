@@ -246,12 +246,27 @@ resurrected: it is logged and surfaced with one comment on `board_issue`.
 The rollout switch:
 
 - `report-only` (shipped default): every wake decision is computed and **logged
-  (`question_would_wake`) but nothing is sent**. Decisions are marked consumed
-  in this mode, so after a day of verified decisions, flipping to `send` applies
-  to answers that arrive from then on — old answers are not replayed; a worker
-  that missed one can always pull it with `scripts/wip answers`.
-- `send`: the decisions act (executing, unpaused ticks only).
+  (`question_would_wake`) but nothing is sent**. A report is *not* a delivery:
+  the decision is recorded under a separate `*_observed` event kind
+  (`agent_question_observed`, `decision_request_observed`,
+  `decision_child_wake_observed`) and the delivery kind stays free. So the
+  switch can be finished safely — after a day of verified reports, flipping to
+  `send` delivers those answers, once. Repeating a report-only pass neither
+  re-logs nor re-reports an already observed decision.
+- `send`: the decisions act (executing, unpaused ticks only) and write the
+  delivery kinds (`agent_question`, `decision_request`,
+  `decision_child_wake`), which close a decision in every mode.
 - `off`: the stage does not run.
+
+> **Review note (W3, 2026-11-09).** The first W3 implementation marked answers
+> consumed in `report-only` too, which made the shipped default a one-way door:
+> every question that arrived during the report-only rollout was burned without
+> any worker being woken, and switching to `send` could never replay it. The
+> observed/delivered split above is the fix; `tests/test_questions.py` pins both
+> directions (report then send still delivers, and a delivered decision is
+> never replayed by a later report-only pass). `scripts/wip answers` remains the
+> worker's own fallback for pulling an answer, but it is no longer the only
+> recovery path.
 
 ### W4 — watchdog, backoff, per-PR isolation
 

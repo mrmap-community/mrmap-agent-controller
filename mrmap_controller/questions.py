@@ -33,9 +33,12 @@ surfaced with one comment on the board issue.
 Behaviour is staged by ``questions_enabled``: ``off`` skips the stage,
 ``report-only`` (the shipped default) computes and records the wake decision
 and logs it without any external effect, ``send`` performs it. Dry-run ticks
-and paused controllers act report-only regardless of the setting. Marking a
-decision consumed happens in every mode, so flipping the switch after the
-report-only day does not replay answers that were already decided.
+and paused controllers act report-only regardless of the setting. A report is
+never a delivery: ``report-only`` records the decision under an *observed*
+processed-events kind, so the answers that arrived during the report-only
+rollout are still open when the operator switches to ``send`` -- they are
+delivered then, once, instead of being lost. The delivery kinds are written
+only by a tick that actually sent (or deliberately surfaced) the wake.
 
 Idempotence per stable id: once an ``agent-question`` id or a
 ``decision-request`` id is consumed it stays consumed; edited comments are
@@ -71,9 +74,39 @@ ANSWER_SEGMENT_RE = re.compile(r'(?:^|(?<=[\s;]))((?:Q\d+)(?:\s*(?:/|,|\s+and\s+
 WAKEABLE = (db.CLAIM_SPAWNED, db.CLAIM_ADOPTED)
 
 #: processed_events kinds; the source_id is always the protocol's own id.
+#:
+#: Two generations on purpose. The plain kinds mean *this decision was acted
+#: on* (a wake was delivered, or deliberately not needed because no worker can
+#: be woken). The ``*_observed`` kinds mean *this decision was seen and written
+#: down while ``questions_enabled=report-only``* -- a report, not a delivery.
+#: Keeping them apart is what makes the rollout safe to finish: with a single
+#: kind, an answer that arrived during the report-only day was marked consumed
+#: without anyone being woken, and switching the switch to ``send`` afterwards
+#: could never replay it. Observed entries suppress duplicate report lines but
+#: never block a later delivery.
 KIND_AGENT_QUESTION = 'agent_question'
 KIND_DECISION_REQUEST = 'decision_request'
 KIND_DECISION_CHILD_WAKE = 'decision_child_wake'
+KIND_AGENT_QUESTION_OBSERVED = 'agent_question_observed'
+KIND_DECISION_REQUEST_OBSERVED = 'decision_request_observed'
+KIND_DECISION_CHILD_WAKE_OBSERVED = 'decision_child_wake_observed'
+
+#: delivered/observed pairs, so a stage can ask for "the kind I should write".
+KINDS = {
+    KIND_AGENT_QUESTION: KIND_AGENT_QUESTION_OBSERVED,
+    KIND_DECISION_REQUEST: KIND_DECISION_REQUEST_OBSERVED,
+    KIND_DECISION_CHILD_WAKE: KIND_DECISION_CHILD_WAKE_OBSERVED,
+}
+
+
+def mark_kind(mode, kind):
+    """The processed-events kind this mode should write for ``kind``.
+
+    ``report-only`` never claims to have delivered something: it records the
+    decision under its observed twin, which keeps the delivery kind free for
+    the tick that really sends the wake.
+    """
+    return KINDS[kind] if mode == 'report-only' else kind
 
 
 # --------------------------------------------------------- text plumbing ----
@@ -214,13 +247,14 @@ class QuestionStage:
 
     @property
     def decides(self):
-        """Whether consuming a decision (marking it done) is legitimate now.
+        """Whether writing a processed-events entry for a decision is right now.
 
         Either the operator chose report-only -- then the decision is recorded
-        once and flipping the config later does not replay old answers -- or
-        the stage really acted. A dry-run or paused tick never decides: its
-        would-wake lines are previews, and the still-open question is decided
-        for real by the next executing tick.
+        as *observed*, once, so the report does not repeat every tick and a
+        later ``send`` tick can still deliver it -- or the stage really acted,
+        and the delivery kind closes the decision. A dry-run or paused tick
+        never decides: its would-wake lines are previews, and the still-open
+        question is decided for real by the next executing tick.
         """
         return self.mode == 'report-only' or self.can_act()
 
@@ -299,8 +333,27 @@ class QuestionStage:
                                reason=redact(exc))
 
     def _consume(self, kind, source_id, issue, batch, pr_number=None):
-        db.mark_events(self.c.db, [(kind, source_id, issue, pr_number, batch)],
-                       self.c.now())
+        """Write down what this stage decided about one question.
+
+        In ``report-only`` the entry is the observed twin, never the delivery
+        kind: a report is not a delivery, and the tick that later sends must
+        still find the decision open.
+        """
+        db.mark_events(self.c.db, [(mark_kind(self.mode, kind), source_id, issue,
+                                    pr_number, batch)], self.c.now())
+
+    def _already(self, kind, source_id):
+        """True when this question must not be acted on again.
+
+        A delivered decision is closed in every mode. A merely observed one
+        only closes the *report*: it stops report-only from repeating the same
+        line every tick, and it does not stop a later ``send`` tick from
+        finally waking the worker.
+        """
+        if db.seen(self.c.db, kind, source_id):
+            return True
+        return (self.mode == 'report-only'
+                and db.seen(self.c.db, KINDS[kind], source_id))
 
     def _wake(self, session, message):
         """Wake through the existing AO layer: resume an exited agent, send."""
@@ -371,7 +424,7 @@ class QuestionStage:
                 client, qid = m.group(1), m.group(2)
                 if ANSWERED_MARK in (qc.get('body') or ''):
                     continue          # the worker already pulled it (wip answers)
-                if db.seen(self.c.db, KIND_AGENT_QUESTION, qid):
+                if self._already(KIND_AGENT_QUESTION, qid):
                     continue
                 key = _order_key(qc)
                 replies = [c for c in cs
@@ -414,7 +467,7 @@ class QuestionStage:
                 if not dr_id:
                     self.log.warning('decision_request_without_id', issue=issue)
                     continue
-                if db.seen(self.c.db, KIND_DECISION_REQUEST, dr_id):
+                if self._already(KIND_DECISION_REQUEST, dr_id):
                     continue
                 asks = [a for a in (payload.get('asks') or [])
                         if isinstance(a, dict) and a.get('q')]
@@ -467,7 +520,7 @@ class QuestionStage:
                 last = max(answered.values(), key=_order_key)
                 for child_issue in sorted(children):
                     source = f'{dr_id}:{child_issue}'
-                    if db.seen(self.c.db, KIND_DECISION_CHILD_WAKE, source):
+                    if self._already(KIND_DECISION_CHILD_WAKE, source):
                         continue
                     self._decide_wake(KIND_DECISION_CHILD_WAKE, source,
                                       child_issue, 'scripts/decisions', dr_id,
