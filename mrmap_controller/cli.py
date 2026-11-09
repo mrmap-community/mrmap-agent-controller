@@ -299,6 +299,13 @@ def cmd_doctor(args):
           cfg.docker_test_wrapper)
     gate = Path(cfg.capacity_script)
     check('host capacity gate', gate.is_file(), cfg.capacity_script)
+    from .lifecycle import board_repository
+    wip = Path(cfg.wip_script)
+    root = Path(board_repository(cfg.wip_script) or '')
+    check('work board tool', bool(str(cfg.wip_script)) and wip.is_file()
+          and os.access(wip, os.X_OK) and (root / '.git').exists(),
+          f'{cfg.wip_script or "not configured"}'
+          + (f' runs inside {root}' if str(cfg.wip_script) else ''))
     gh = gh_mod.GitHub(runner, cfg.repo)
     try:
         check('github authentication (gh)', True, f'logged in as {gh.whoami()}')
