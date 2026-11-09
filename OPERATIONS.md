@@ -100,6 +100,40 @@ mrmap-controller stop            # TERM, then KILL after 40s; releases the lock
 `start --execute` is the activation command on this host. Before running it, flip
 `"dry_run": false` in `config.json` if you want the loop to act without `--execute`.
 
+### Loop start (verified)
+
+The loop process actually running was inspected through `/proc` on 2026-11-09
+(pid `2489101`, recorded in `run/controller.pid`). Its real shape:
+
+| Fact | Value |
+| --- | --- |
+| Command line | `/usr/bin/python3 -m mrmap_controller.cli loop --write-pidfile` |
+| Interpreter | `/usr/bin/python3` (Python 3.13) |
+| Working directory | `/home/ota/.ao/mrmap-controller` |
+| stdout / stderr | both `logs/loop.log` (JSON lines from the stderr handler land here) |
+| Start | `Fri Nov 6 15:37:01 2026`, detached (`setsid`, parent pid 1) |
+| systemd | not a unit — this host has no systemd user bus; `systemd/*.unit` files are inert |
+
+Behaviour-relevant environment (non-secret values, read from `/proc/2489101/environ`):
+
+- `MRMAP_CONTROLLER_CONFIG=/home/ota/.ao/mrmap-controller/config.json`
+- `PYTHONPATH=/home/ota/.ao/mrmap-controller` (present twice: the wrapper appends it to an
+  already-set value)
+- Everything else is inherited from the operator's login shell (desktop/VNC variables);
+  secret-looking values are deliberately not recorded here.
+
+This is exactly what the entry point produces. The verified restart command — after
+`mrmap-controller stop` confirmed the old loop is gone — is:
+
+```bash
+cd /home/ota/.ao/mrmap-controller
+setsid ./bin/mrmap-controller loop --write-pidfile >> logs/loop.log 2>&1 &
+```
+
+`bin/mrmap-controller` exports `MRMAP_CONTROLLER_CONFIG` (defaulting to `config.json`) and
+`PYTHONPATH`, then execs `python3 -m mrmap_controller.cli`. The pidfile check in `loop` is
+advisory only; never run two schedulers.
+
 ### To turn it off
 
 ```bash
