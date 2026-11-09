@@ -1,0 +1,101 @@
+name: CI
+
+# WHERE THIS BELONGS, AND WHY IT IS SITTING HERE.
+# GitHub refuses to let this repository's bot token create or update anything
+# under .github/workflows: a workflow is code that runs with the repository's
+# permissions, and the token behind the agent has no "workflows" scope. That is
+# a reasonable boundary, so it is kept: a human activates this file with
+#
+#     mkdir -p .github/workflows && cp ci/ci.yml .github/workflows/ci.yml
+#
+# tests/test_packaging.py fails if the copy in .github/ and this one ever differ,
+# so activating it cannot leave two versions behind.
+#
+# Everything the controller tests is offline: GitHub and AO are the doubles in
+# tests/fakes.py, the state database is a temporary file, and the capacity gate
+# is stubbed. So a runner needs no credentials, no network and no mrmap host.
+# The one thing that genuinely needs the deployment host -- the pilot
+# gatekeeper's own schema module -- is never replaced by a false green: on a host
+# without that file the three tests in AgainstTheRealPilot skip themselves out
+# loud, so the summary reads "skipped=3" and that half of the proof stays a run
+# on the deployment host.
+#
+# There are no third-party dependencies: the package and the tests are
+# standard library only, so there is nothing to install and nothing to pin.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: offline suite (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.13 is what this deployment actually runs; 3.11 is a supported floor
+        # family that keeps the version check in `doctor` honest.
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Compiles every module, including the ones no test imports.
+      - name: byte-compile package and tests
+        run: python -m compileall -q mrmap_controller tests
+
+      # Verbose on purpose: skip reasons are part of the evidence.
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+
+  static:
+    name: shell, config and secret surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The installer and the launcher are the only entry points that are not
+      # Python, and a syntax error in either is an install that fails on the
+      # deployment host -- the worst place to find out.
+      - name: shell surface parses and stays executable
+        run: |
+          set -euo pipefail
+          for script in install.sh bin/mrmap-controller; do
+            test -x "$script" || { echo "::error::$script is not executable"; exit 1; }
+            bash -n "$script"
+          done
+
+      # This repository is cloned by an agent that holds a GitHub login and runs
+      # on a host that holds production state. Nothing committed here may carry
+      # credential-shaped material. The URL rule asks for a long secret segment
+      # on purpose: tests/test_adapters.py holds the literal string
+      # "https://x-access-token:SECRET@github.com" as a redaction fixture, and a
+      # check that flags it would be turned off rather than obeyed.
+      - name: no secret-shaped material
+        run: |
+          set -euo pipefail
+          pattern='-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{20,}|gh[suro]_[0-9A-Za-z]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z]{10,}|AIza[0-9A-Za-z_-]{35}|https://[^ /@]{3,}:[^ /@]{15,}@github\.com'
+          if grep -rInE -e "$pattern" --exclude-dir=.git --exclude-dir=__pycache__ . ; then
+            echo "::error::secret-shaped material in the tree; sanitize before review"
+            exit 1
+          fi
+
+      # Runtime state is what the incidents were about: an installed config, a
+      # live database or a log must never end up version-controlled.
+      - name: no runtime state tracked
+        run: |
+          set -euo pipefail
+          tracked="$(git ls-files | grep -E '(^|/)(config\.json|state\.sqlite3(\.|-.*)?|[^/]*\.log|\.pid)$' || true)"
+          if [ -n "$tracked" ]; then
+            echo "::error::runtime state is tracked in git: $tracked"
+            exit 1
+          fi
