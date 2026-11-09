@@ -78,6 +78,11 @@ class EventLogger:
     def error(self, event, **fields):
         self.log(logging.ERROR, event, **fields)
 
+    def critical(self, event, **fields):
+        # The watchdog's stall line. The stream handler's JSON reaches the
+        # loop's stderr, which the loop redirects into logs/loop.log.
+        self.log(logging.CRITICAL, event, **fields)
+
     def __getattr__(self, name):
         return getattr(self._logger, name)
 

@@ -69,7 +69,7 @@ class Capacity:
 
 class Controller:
     def __init__(self, cfg, gh, ao, database, log, capacity_probe=None,
-                 pause_file=None, execute=False, now=None):
+                 pause_file=None, execute=False, now=None, board_refresher=None):
         self.cfg = cfg
         self.gh = gh
         self.ao = ao
@@ -80,6 +80,11 @@ class Controller:
         self.pause_file = Path(pause_file) if pause_file else None
         self.capacity_probe = capacity_probe if capacity_probe is not None \
             else lambda: self._host_capacity()
+        # W5: the board refresh is injectable for tests (like capacity_probe);
+        # production runs scripts/wip board through lifecycle.refresh_board.
+        self.board_refresher = board_refresher if board_refresher is not None \
+            else lambda: st.refresh_board(self.cfg, self.log)
+        self.claims_changed = False
         self.gh_ok = True
         self.ao_ok = True
         self.actions = []
@@ -198,6 +203,7 @@ class Controller:
                            detail=note)
             return
         db.set_claim(self.db, issue, state, self.now(), note=note, session_id=session_id)
+        self.claims_changed = True
 
     # ------------------------------------------------------- reconciliation --
     def reconcile(self, capacity):
@@ -328,6 +334,7 @@ class Controller:
                 if not claim and self.execute:
                     db.claim_issue(self.db, number, db.CLAIM_SPAWNED, self.now(),
                                    'adopted existing AO session', session_id=sess.id)
+                    self.claims_changed = True
                 self.event('SKIP', issue=number, session=sess.id,
                            reason='an AO worker session already carries this issueId')
                 continue
@@ -392,6 +399,9 @@ class Controller:
             self.event('DEFER', issue=number,
                        reason='controller pause marker present; start is report-only')
             return
+        # From here every path writes the claim row (reserve, re-arm, or move it
+        # after a refused/uncertain start); board refresh is owed either way.
+        self.claims_changed = True
         title = (issue.get('title') or '')[:80]
         existing = db.get_claim(self.db, number)
         if existing and existing['state'] == db.CLAIM_RELEASED:
@@ -511,14 +521,69 @@ class Controller:
 
     def follow_pull_requests(self, capacity):
         for issue in self.tracked_issues():
+            claim = db.get_claim(self.db, issue)
+            if claim and claim['state'] == db.CLAIM_MERGED:
+                # W1: a merged claim is retired. The row stays for audit and
+                # keeps intake away, but the merged pull request is never
+                # re-fetched again -- until the incident audit this cost 53
+                # `gh pr view` calls every tick, forever.
+                continue
             try:
                 self._follow_one(issue, capacity)
             except (GithubError, AOError) as exc:
                 # One issue's uncertainty must not stop the others; it also must
                 # not turn into an action.
                 self.event('SKIP', issue=issue, reason=f'uncertain state: {redact(exc)}')
+            except Exception as exc:
+                # W4: a controller-side error in one issue's follow (a schema
+                # problem, a bug, anything) is isolated to that issue. Before
+                # this, one poison pull request aborted the whole tick -- 456
+                # times. The runs ledger keeps outcome 'ok' and the other pull
+                # requests are still followed; the failure gets a bounded
+                # backoff instead of a per-tick retry storm.
+                self.event('PR_FOLLOW_FAILED', issue=issue, reason=redact(exc))
+                self._record_follow_failure(issue, exc)
+
+    def _record_follow_failure(self, issue, exc):
+        """Bookkeep a controller-side follow failure and open the retry window.
+
+        The state is one dispatch row per issue, deduped on ``follow_error``
+        (a kind no delivery budget reads), so the backoff is restart-safe in
+        the same table as the deliveries: ``attempts`` counts occurrences and
+        the next retry moves out by a window that doubles from the tick
+        interval, capped at 6 hours. Recording failures is the controller's
+        own ledger, so it happens in dry-run too.
+        """
+        key = f'follow_error:{issue}'
+        try:
+            existing = db.dispatch_for(self.db, key)
+            if existing is None:
+                row = db.get_issue(self.db, issue)
+                db.try_reserve_dispatch(self.db, 'follow_error', issue, key,
+                                        self.now(),
+                                        pr_number=row['pr_number'] if row else None,
+                                        detail=redact(exc))
+                attempts = 1
+            else:
+                db.bump_dispatch(self.db, key)
+                attempts = int(existing['attempts']) + 1
+            delay = _backoff_delay(self.cfg, attempts)
+            db.set_dispatch(self.db, key, 'failed', detail=redact(exc),
+                            next_retry_at=_retry_after(self.now(), delay))
+        except Exception as record_exc:      # never let bookkeeping mask the bug
+            self.log.error('follow_failure_bookkeeping_failed', issue=issue,
+                           reason=redact(record_exc))
 
     def _follow_one(self, issue, capacity):
+        # W4 backoff gate: a controller-side failure of this issue's follow is
+        # retried no earlier than its bounded window says.
+        err = db.dispatch_for(self.db, f'follow_error:{issue}')
+        if err and err['status'] == 'failed' \
+                and _retry_wait(err['next_retry_at'], self.now()):
+            self.event('DEFER', issue=issue, pr=err['pr_number'],
+                       reason=f'controller-side failure backoff: next attempt '
+                              f'no earlier than {err["next_retry_at"]}')
+            return
         row = db.get_issue(self.db, issue)
         if row and row['state'] == st.PAUSED:
             paused = True
@@ -549,6 +614,21 @@ class Controller:
             return                                  # reconcile already reported it
         pr_number = self.pr_for(issue, session)
         if pr_number is None:
+            claim = db.get_claim(self.db, issue)
+            claim_state = claim['state'] if claim else None
+            if claim_state in (db.CLAIM_RECONCILE, db.CLAIM_MERGED):
+                # W1: the claims row is the source of truth and the issues row
+                # is its derived projection. A quarantined claim must never be
+                # projected back to an active state by a dead session still
+                # carrying the issueId -- until the incident audit, issues #981
+                # said running/mrmap-77 forever while its claim read
+                # needs_reconciliation. A merged claim never re-opens either.
+                if claim_state == db.CLAIM_RECONCILE:
+                    db.upsert_issue(self.db, issue, st.FAILED, self.now(),
+                                    session_id=claim['session_id'],
+                                    reason='claim quarantined; the issues row '
+                                           'follows the claim, not the session')
+                return
             if session:
                 db.upsert_issue(self.db, issue, st.RUNNING, self.now(),
                                 session_id=session.id)
@@ -834,6 +914,14 @@ class Controller:
             self.reconcile(capacity)
             self.intake(capacity)
             self.follow_pull_requests(capacity)
+            if self.execute and self.claims_changed:
+                # W5: board #917 is only regenerated by scripts/wip commands,
+                # so a tick that moved a claim must ask wip for a refresh --
+                # the board's format stays wip's, duplicated nowhere here.
+                try:
+                    self.board_refresher()
+                except Exception as exc:     # a board problem never eats a tick
+                    self.log.warning('board_refresh_failed', reason=redact(exc))
             if self.controller_paused:
                 self.log.warning('controller_paused', mode=mode,
                                  detail='pause marker present; nothing was executed')
@@ -855,10 +943,88 @@ def _check_names(failures):
     return ', '.join(f'{f.get("name")}({f.get("conclusion")})' for f in failures[:8])
 
 
+#: W4: controller-side retries double from one tick interval and stop at 6 h.
+BACKOFF_CAP_SECONDS = 6 * 3600
+
+
+def _backoff_delay(cfg, attempts):
+    """Seconds to wait before the ``attempts``-th controller-side retry."""
+    interval = max(60, int(cfg.poll_interval_minutes) * 60)
+    return min(interval * 2 ** max(0, int(attempts) - 1), BACKOFF_CAP_SECONDS)
+
+
+def _retry_after(now_iso, delay_seconds):
+    import datetime as dt
+    base = dt.datetime.fromisoformat(now_iso)
+    return (base + dt.timedelta(seconds=delay_seconds)).isoformat(timespec='seconds')
+
+
+def _retry_wait(next_retry_iso, now_iso):
+    """Seconds remaining until ``next_retry_iso``, or None when nothing gates.
+
+    Unparsable or empty timestamps never gate: a broken backoff marker must
+    not become a silent stall -- the tick retries as it always did.
+    """
+    import datetime as dt
+    if not next_retry_iso:
+        return None
+    try:
+        target = dt.datetime.fromisoformat(next_retry_iso)
+        now = dt.datetime.fromisoformat(now_iso)
+    except (TypeError, ValueError):
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    remaining = (target - now).total_seconds()
+    return remaining if remaining > 0 else None
+
+
+def loop_watchdog(database, gh, log, board_issue, threshold=3):
+    """Alert once when ``threshold`` consecutive finished ticks aborted (W4).
+
+    Called by the loop after every tick, healthy or not. On a streak it writes
+    one CRITICAL line -- visible in ``logs/loop.log`` (the loop's stderr) and
+    ``logs/controller.jsonl`` -- and posts exactly one comment on the board
+    issue through the gh layer. Dedupe rides on processed_events and is keyed
+    by ``db.abort_streak``'s anchor, so a continuing stall cannot spam the
+    board and a recovered stall may alert again. A failed post stays unmarked
+    so the next tick retries it. Nothing is ever restarted: the loop is the
+    operator's decision, not the controller's.
+    """
+    count, anchor = db.abort_streak(database)
+    if count < threshold:
+        return False
+    key = f'stall:{anchor}'
+    if db.seen(database, 'loop_stall', key):
+        return False
+    log.critical('loop_stalled',
+                 detail=f'{count} consecutive ticks aborted since run #{anchor}; '
+                        f'the loop process is alive but its ticks fail -- see '
+                        f'event tick_aborted in logs/controller.jsonl')
+    if board_issue:
+        try:
+            gh.post_issue_comment(int(board_issue), (
+                '[mrmap-controller] WATCHDOG: the scheduler loop aborted '
+                f'{count} consecutive ticks (streak after run #{anchor}). The '
+                'loop process keeps running but its ticks fail; inspect the '
+                '"tick_aborted" events in logs/controller.jsonl and the runs '
+                'table of the state database. The controller does not restart '
+                'itself, and this alert is posted once per stall episode.'))
+        except GithubError as exc:
+            log.error('loop_stall_alert_failed', reason=redact(exc))
+            return False                   # unmarked: next tick retries
+    db.mark_events(database, [('loop_stall', key, None, None, 'watchdog')],
+                   utcnow_factory()())
+    return True
+
+
 _EVENT_LEVELS = {
     # Informational outcomes log at INFO; everything an operator should look at
     # logs at WARNING, and a controller-side failure logs at ERROR.
     'NEEDS_HUMAN': 40, 'ABORTED': 40, 'DISPATCH_FAILED': 40, 'INTAKE_BLOCKED': 40,
+    'PR_FOLLOW_FAILED': 40,
     'WOULD_QUARANTINE': 30,
     'SPAWN_UNCERTAIN': 30, 'REJECT': 30, 'DEFER': 30,
 }

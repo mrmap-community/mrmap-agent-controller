@@ -45,6 +45,9 @@ DEFAULTS = {
     # worker environment
     'docker_test_wrapper': '/home/ota/.ao/bin/mrmap-docker-test',
     'capacity_script': '/home/ota/agent-orchestrator-test/mrmap/scripts/agent_capacity',
+    # work board refresh (W5) and stall alerting (W4)
+    'wip_script': '/home/ota/agent-orchestrator-test/mrmap/scripts/wip',
+    'board_issue': 917,
     # behaviour switches
     'count_foreign_workers': True,
     'allow_restore_terminated': False,
@@ -57,7 +60,8 @@ DEFAULTS = {
 
 _INT_KEYS = ('max_workers', 'poll_interval_minutes', 'max_ci_attempts_per_pr',
              'max_review_rounds_per_pr', 'spawn_reconcile_grace_minutes',
-             'command_timeout_seconds', 'message_max_chars', 'quote_max_chars')
+             'command_timeout_seconds', 'message_max_chars', 'quote_max_chars',
+             'board_issue')
 _BOOL_KEYS = ('dry_run', 'count_foreign_workers', 'allow_restore_terminated',
               'use_thread_resolution')
 _LIST_KEYS = ('approvers', 'review_allowlist', 'review_associations',

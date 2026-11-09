@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 from . import __version__, ao as ao_mod, config as config_mod, db, github as gh_mod
-from .core import Controller, claim_holds
+from .core import Controller, claim_holds, loop_watchdog
 from .logging_util import redact, setup
 from .runner import Runner, assert_allowed
 
@@ -65,6 +65,32 @@ def exclusive_lock(cfg, log, block=False):
     except OSError as exc:
         handle.close()
         raise SystemExit(f'cannot take the intake lock: {redact(exc)}')
+    return handle
+
+
+def loop_instance_lock(cfg, log):
+    """Hard single-instance guard for the scheduler loop (W4).
+
+    The pidfile check in ``cmd_loop`` is advisory: it races and it does not
+    notice a loop that never wrote one. The flock on ``<state_dir>/loop.lock``
+    is not: the kernel drops it exactly when the holder dies. The handle is
+    returned, deliberately not closed -- the caller must keep it open for the
+    loop's lifetime. Ticks are unaffected, and a loop already running without
+    this guard is never touched; the refusal applies from the next start.
+    """
+    lock_path = Path(cfg.state_db).parent / 'loop.lock'
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, 'a+')
+    try:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        log.warning('loop_instance_locked', detail=str(lock_path))
+        return None
+    except OSError as exc:
+        handle.close()
+        raise SystemExit(f'cannot take the loop lock {lock_path}: {redact(exc)}')
     return handle
 
 
@@ -396,21 +422,29 @@ def cmd_loop(args):
 
     signal.signal(signal.SIGTERM, handler)
     signal.signal(signal.SIGINT, handler)
-    RUN_DIR.mkdir(exist_ok=True)
-    if args.write_pidfile:
-        if PIDFILE.exists():
-            existing = PIDFILE.read_text().strip()
-            try:
-                os.kill(int(existing), 0)
-                print(f'loop already running with pid {existing}; refusing')
-                return 1
-            except (ValueError, OSError):
-                pass
-        PIDFILE.write_text(str(os.getpid()))
-    log.info('loop_start', detail=f'interval={interval}s mode='
-                                  f'{"execute" if not args.dry_run else "dry-run"}')
-    execute = not args.dry_run
+    # W4: refuse a second loop from this start onwards. The advisory pidfile
+    # check below stays as the friendly message for the common case; the flock
+    # is the enforcing guard and the handle lives as long as this function.
+    loop_lock = loop_instance_lock(cfg, log)
+    if loop_lock is None:
+        print('Another loop holds <state_dir>/loop.lock; refusing to start a '
+              'second scheduler. The running loop was not touched.')
+        return 1
     try:
+        RUN_DIR.mkdir(exist_ok=True)
+        if args.write_pidfile:
+            if PIDFILE.exists():
+                existing = PIDFILE.read_text().strip()
+                try:
+                    os.kill(int(existing), 0)
+                    print(f'loop already running with pid {existing}; refusing')
+                    return 1
+                except (ValueError, OSError):
+                    pass
+            PIDFILE.write_text(str(os.getpid()))
+        log.info('loop_start', detail=f'interval={interval}s mode='
+                                      f'{"execute" if not args.dry_run else "dry-run"}')
+        execute = not args.dry_run
         while not stop['requested']:
             started = time.time()
             _run_once(cfg, log, execute)
@@ -427,6 +461,7 @@ def cmd_loop(args):
                     PIDFILE.unlink()
             except (ValueError, OSError):
                 pass
+        loop_lock.close()
         log.info('loop_end')
     return 0
 
@@ -439,13 +474,21 @@ def _run_once(cfg, log, execute):
     conn = open_db(cfg, log)
     try:
         runner = controller_runner(cfg, log)
+        gh = gh_mod.GitHub(runner, cfg.repo)
         controller = Controller(
-            cfg, gh_mod.GitHub(runner, cfg.repo),
-            ao_mod.AO(runner, cfg.ao_project, timeout=cfg.command_timeout_seconds),
+            cfg, gh, ao_mod.AO(runner, cfg.ao_project, timeout=cfg.command_timeout_seconds),
             conn, log, pause_file=PAUSE_MARKER, execute=execute)
-        controller.tick()
-    except Exception as exc:
-        log.error('tick_crashed', reason=redact(exc), detail='loop continues')
+        try:
+            controller.tick()
+        except Exception as exc:
+            log.error('tick_crashed', reason=redact(exc), detail='loop continues')
+        # W4 watchdog: after this tick's runs row is final, look for a streak
+        # of aborted ticks and alert the operator once per stall episode. A
+        # broken watchdog must never end the loop either.
+        try:
+            loop_watchdog(conn, gh, log, cfg.board_issue)
+        except Exception as exc:
+            log.error('watchdog_error', reason=redact(exc))
     finally:
         conn.close()
         lock.close()
