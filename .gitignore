@@ -13,3 +13,12 @@ intake.lock
 # python bytecode
 __pycache__/
 *.pyc
+
+# Local configuration and runtime data
+config.json
+result.txt
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
