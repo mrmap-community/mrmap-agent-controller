@@ -1,0 +1,17 @@
+[Unit]
+Description=Run the MrMap Agent Controller every five minutes
+# An inactive timer is a visible fact: AO automation stays disabled so exactly
+# one scheduler assigns work.
+Requires=mrmap-controller.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=1min
+RandomizedDelaySec=30
+# After an outage or a long shutdown, run once at the next start instead of
+# waiting a full interval: the tick reconciles whatever the crash left behind.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

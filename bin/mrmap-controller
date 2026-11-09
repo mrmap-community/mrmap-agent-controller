@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Entry point for the MrMap Agent Controller.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+INSTALL="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+export MRMAP_CONTROLLER_CONFIG="${MRMAP_CONTROLLER_CONFIG:-$INSTALL/config.json}"
+export PYTHONPATH="$INSTALL${PYTHONPATH:+:$PYTHONPATH}"
+
+exec python3 -m mrmap_controller.cli "$@"

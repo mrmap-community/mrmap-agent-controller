@@ -1,0 +1,15 @@
+# runtime output, not source
+logs/
+run/
+backups/
+# shared state lives in /home/ota/.ao/mrmap-gatekeeper; these patterns catch any
+# state file that ever lands inside the install by accident
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+state/
+intake.lock
+# python bytecode
+__pycache__/
+*.pyc

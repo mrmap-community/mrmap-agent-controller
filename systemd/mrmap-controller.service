@@ -1,0 +1,27 @@
+[Unit]
+Description=MrMap Agent Controller tick (issue intake, CI and review follow-up)
+Documentation=file:@INSTALL@/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# One tick per activation. Overlapping activations are impossible in effect:
+# the tick takes an exclusive lock on the shared intake lock file and exits 0
+# without acting when it cannot have it.
+Type=oneshot
+ExecStart=@INSTALL@/bin/mrmap-controller tick --execute
+WorkingDirectory=@INSTALL@
+UMask=0077
+Nice=10
+TimeoutStartSec=20min
+Restart=no
+StandardOutput=journal
+StandardError=journal
+# The controller has no privileged path: it never merges, approves, resolves
+# review threads, writes labels or touches Docker cleanup -- enforced by its own
+# deny list, and nothing here grants more than the operator already has.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
