@@ -237,6 +237,22 @@ def release_claim(db, issue, now, note):
 
 # --------------------------------------------------------------- issues -----
 
+def events_for_issue(db, issue, kinds):
+    """Source ids recorded for this issue under any of ``kinds``.
+
+    W8 reads this to tell "the worker died" apart from "the work is parked on a
+    human answer": an unanswered decision request is not a fault, and waking
+    anything for it would be noise.
+    """
+    kinds = tuple(kinds)
+    if not kinds:
+        return []
+    placeholders = ','.join('?' * len(kinds))
+    return [row['source_id'] for row in db.execute(
+        f'SELECT source_id FROM processed_events WHERE issue=? '
+        f'AND kind IN ({placeholders}) ORDER BY processed_at', (issue, *kinds))]
+
+
 def upsert_issue(db, issue, state, now, session_id=None, pr_number=None,
                 head_sha=None, ci_status=None, review_state=None, reason=None):
     existing = db.execute('SELECT * FROM issues WHERE issue=?', (issue,)).fetchone()

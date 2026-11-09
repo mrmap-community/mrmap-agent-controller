@@ -310,7 +310,7 @@ class Controller:
             if existing and existing['pr_number']:
                 continue                      # pull request tracking handles it
             if state in (db.CLAIM_SPAWNED, db.CLAIM_SPAWNING, db.CLAIM_QUEUED):
-                if self._within_grace(claim['created_at']):
+                if self.within_grace(claim['created_at']):
                     self.event('PENDING_SPAWN', issue=issue,
                                reason='claim exists without a live session and is '
                                       'still inside the spawn grace window')
@@ -338,7 +338,13 @@ class Controller:
                              session_id=claim['session_id'],
                              reason='claim quarantined')
 
-    def _within_grace(self, created_at):
+    def within_grace(self, created_at):
+        """Still inside the spawn grace window -- a claim that may not be judged yet.
+
+        Public because :mod:`mrmap_controller.recovery` asks the same question
+        when it explains a quarantine: one rule about "too young to conclude",
+        asked in two places, must not become two rules.
+        """
         import datetime as dt
         try:
             created = dt.datetime.fromisoformat(created_at)

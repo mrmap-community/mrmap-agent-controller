@@ -113,6 +113,8 @@ bin/mrmap-controller doctor      # every precondition: gh, AO, config, state, ca
 bin/mrmap-controller tick        # one dry run; prints what it would do
 bin/mrmap-controller status      # what it currently believes, per issue
 bin/mrmap-controller logs -n 40  # last structured events
+bin/mrmap-controller reconcile   # what each stuck work item actually is (reads only)
+bin/mrmap-controller reconcile --issue 1009 --explain
 bin/mrmap-controller reconcile-closing   # merged PRs whose issue is still open (W2)
 ```
 
@@ -309,6 +311,48 @@ the controller refuses to pick a winner: the claim goes to
 `NEEDS_HUMAN` with both numbers in the reason. A human decides which reading is
 right — usually by fixing the branch, or by `release <issue> --confirm` to let
 the issue be worked again.
+
+### W8 — what a stuck work item is (`reconcile`, `recover`)
+
+A quarantine means *nobody knows*, and after a week of crashes that was true for
+eight issues at once. `reconcile` turns *nobody knows* into a per-issue answer.
+It reads the same facts a tick reads (claim, projection, GitHub issue and
+approval, linked pull requests with CI and review, AO session liveness and
+branch identity) and gives each item one kind, with the evidence underneath:
+
+| kind | what it means | what follows |
+| --- | --- | --- |
+| `live_worker` | an agent is executing or idle on it | nothing — the loop owns it |
+| `awaiting_pr_review` | the work is on an open pull request | the follow loop keeps working it |
+| `ready_for_human_merge` | CI green and approved | a human merges |
+| `completed_merged_unconfirmed` | merged pull requests point at it, issue still open | a human closes it, or `release` |
+| `issue_closed` | GitHub says closed | `release <issue> --confirm` retires the claim |
+| `not_approved` | paused, or no current human approval | a human decides; no worker starts |
+| `safely_resumable` | the session exists and is merely not running | `recover <issue> --confirm` |
+| `orphaned_claim` | claim without a session, nothing pushed | `release <issue> --confirm` |
+| `pending_spawn` | claim taken, spawn unconfirmed, still inside the grace window | wait a tick — acting here is the double-start |
+| `waiting_for_human_answer` | parked on an unanswered decision | a human answers; nothing may wake first |
+| `ambiguous_needs_human` | two readings exist (two PRs, two sessions, branch contradicts assignment) | a human chooses — the tool never picks |
+| `facts_uncertain` | GitHub or AO unreadable | `doctor` first; nothing may be concluded |
+
+`reconcile` prints and changes nothing, so run it as often as you like. Without
+`--issue` it covers the claims that are not at rest (`--all` includes those
+already retired as merged; merged-but-still-open issues are `reconcile-closing`'s
+job).
+
+`recover` is the only recovery the controller performs, and it is the smallest
+one: it wakes a session that is merely asleep. It refuses — without `--confirm`,
+when the claim names a different session, when a second live session carries the
+issue, when the worker cap is reached, when the branch contradicts the
+assignment, when facts are uncertain, and always for a **terminated** session.
+A terminated session's worktree may hold commits nobody pushed; the controller
+neither looks inside one nor deletes one. That is a human decision.
+
+Live example from the eight: #1009 → `awaiting_pr_review` (PR #1114), #981 →
+`completed_merged_unconfirmed` (merged #995 and #1131 point at it), #948 →
+`orphaned_claim` (terminated session, on the prompt-echo branch
+`ao/implement-github-issue-6/root` — which declares no issue #6, see W6),
+#829/#1032/#1078/#1085 → `issue_closed` since the audit was written.
 
 ---
 
